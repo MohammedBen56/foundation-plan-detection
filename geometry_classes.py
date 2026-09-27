@@ -142,6 +142,7 @@ FAMILY = {"column": "column", "shear_wall": "wall", "retaining_wall": "wall", "c
 # 1. Objects
 # ---------------------------------------------------------------------------
 def obj(kind, g, k, **extra):
+    g = es.valid_polygon(g)
     o = ds.oriented(g, k) if g.geom_type == "Polygon" else None
     d = {"kind": kind, "g": g, "geom": g, "o": o, "feat": {}, "label": None, "cluster": None, "cls": None}
     d.update(extra)
@@ -417,6 +418,7 @@ def objects(paths, texts, k):
     es.mark_dashed(segs, k)
     log = {}
     rects, dups, others = es.filled_objects(paths, k)
+    others = [es.valid_polygon(g) for g in others]
     solids = [r["g"] for r in rects]
     # walls drawn around corners as one object: fills no thicker than twice the usual solid width
     thin = 2 * statistics.median(r["o"]["width_m"] for r in rects) if rects else 0.4
@@ -549,6 +551,23 @@ def objects(paths, texts, k):
             borders.append(o)
     out = [o for o in out if not any(o is b for b in borders)]
     log["wall_borders_dropped"] = len(borders)
+    # one element drawn as boxes inside one another around the same centre (a pit: its slab, walls
+    # and opening; a ring beam: its outer and inner edges) is one object: the outer box, keeping the
+    # inner boxes' sizes as its parts
+    boxes = sorted((o for o in out if o["kind"] == "outline" and o["o"]), key=lambda o: -o["g"].area)
+    inner = set()
+    for a in boxes:
+        if id(a) in inner:
+            continue
+        parts = [b for b in boxes if b is not a and id(b) not in inner and b["g"].area < a["g"].area
+                 and b["g"].intersection(a["g"]).area >= 0.95 * b["g"].area
+                 and a["g"].centroid.distance(b["g"].centroid) <= G.size_tol * k
+                 and abs((a["o"]["angle_deg"] - b["o"]["angle_deg"] + 90) % 180 - 90) <= G.parallel_deg]
+        if parts:
+            a["nested"] = sorted(((round(b["o"]["length_m"], 3), round(b["o"]["width_m"], 3)) for b in parts), reverse=True)
+            inner.update(id(b) for b in parts)
+    out = [o for o in out if id(o) not in inner]
+    log["nested_boxes_merged"] = len(inner)
     fams = band_families(pairs)
     log["band_families"] = [{"width": f["width"], "paired_m": f["paired_m"], "filled_share": f["filled_share"]} for f in fams]
     outl = [o["g"] for o in out if o["kind"] == "outline"]
@@ -629,6 +648,7 @@ def features(objs, tiny, k, circ=()):
         f["on_stamped_region"] = int(any(r["g"].buffer(G.on_region * k).contains(g.centroid) for r in stamped if r is not o))
         f["touches_cross_hatch"] = int(any(h["g"].distance(g) < G.near * k for h in hatch if h is not o))
         f["outline_pen"] = o.get("outline_pen_rel", 0.0)
+        f["nested_boxes"] = int(bool(o.get("nested")))       # drawn as boxes inside one another
         f["stamp_inside"] = int(o["kind"] == "outline" and any(g.contains(c) and c.buffer(r).within(g) for c, r in circ))
     perimeter_flags(objs, k)
 
@@ -641,7 +661,7 @@ FEATURES = {
               ("touches_solid", 3.0), ("inside_outline", 0.7), ("in_band_holding_solid", 1.0),
               ("on_stamped_region", 0.7), ("outline_pen", 3.0), ("on_perimeter", 2.0)],
     "outline": [("log_length", 1.0), ("log_width", 1.0), ("solids_inside", 3.0), ("log_dots", 1.0),
-                ("empty_bands_touching", 0.5)],
+                ("empty_bands_touching", 0.5), ("nested_boxes", 3.0)],
 }
 
 
@@ -657,7 +677,8 @@ def matrix(objs, spec):
              "on_stamped_region": f["on_stamped_region"], "solids_inside": min(f["solids_inside"], 3) / 3,
              "log_dots": min(math.log1p(f["dots_inside"]) / 4, 1.0),
              "empty_bands_touching": min(f["empty_bands_touching"], 3) / 3, "stamp_inside": f.get("stamp_inside", 0),
-             "outline_pen": f.get("outline_pen", 0.0), "on_perimeter": f.get("on_perimeter", 0)}
+             "outline_pen": f.get("outline_pen", 0.0), "on_perimeter": f.get("on_perimeter", 0),
+             "nested_boxes": f.get("nested_boxes", 0)}
         rows.append([v[n] for n, _ in spec])
     X = np.array(rows, dtype=float)
     for j, (n, w) in enumerate(spec):
@@ -903,6 +924,7 @@ def name_clusters(info, labels, objs, m, dims=None):
     HOME.clear()
     HOME.update({kd: {dk for dk, a in aff.items() if a >= G.affinity_min} for kd, aff in affinity.items()})
     votes = collections.defaultdict(collections.Counter)
+    voters = collections.defaultdict(lambda: collections.defaultdict(list))
     for li, (i, cost, _) in m.items():
         if not dims_agree(labels[li], objs[i]):
             continue
@@ -910,6 +932,7 @@ def name_clusters(info, labels, objs, m, dims=None):
             continue
         for oi, kind in compound_targets(labels[li], i, objs):
             votes[objs[oi]["cluster"]][kind] += 1
+            voters[objs[oi]["cluster"]][kind].append(objs[oi])
     for c in info:
         v = votes[c["id"]]
         total = sum(v.values())
@@ -938,6 +961,21 @@ def name_clusters(info, labels, objs, m, dims=None):
     for o in objs:
         o["cls"] = names[o["cluster"]]
         o["named_by"] = how[o["cluster"]]
+    # a cluster's name is not stretched to members far outside the sizes its labels cover (a crane's
+    # ring beam drawn as nested boxes clusters with the pits, but is twice their size): such a member
+    # keeps no class unless its own label gives one
+    for c in info:
+        if c["named_by"] != "label vote" or c["kind"] not in FEATURES:
+            continue
+        kind = max(votes[c["id"]], key=votes[c["id"]].get)
+        vs = voters[c["id"]][kind]
+        lo_L, hi_L = min(v["feat"]["length"] for v in vs), max(v["feat"]["length"] for v in vs)
+        lo_W, hi_W = min(v["feat"]["width"] for v in vs), max(v["feat"]["width"] for v in vs)
+        for o in objs:
+            f = o["feat"]
+            if o["cluster"] == c["id"] and not (lo_L - G.size_tol <= f["length"] <= hi_L + G.size_tol
+                                                and lo_W - G.size_tol <= f["width"] <= hi_W + G.size_tol):
+                o["cls"], o["named_by"], o["cluster_name"] = None, f"outside the sizes cluster {c['id']}'s labels cover", c["name"]
     return votes
 
 
@@ -1269,7 +1307,7 @@ def write_workbook(path, objs, info, labels, m1, m2, log, ver, dpi, calib):
         c = cinfo[o["cluster"]]
         vals = {"ID": o["id"], "Building": o["building"] or "unknown", "Building from": o.get("building_source", ""),
                 "Drawing kind": o["kind"], "Cluster": o["cluster"],
-                "Class": o["cls"] or "unnamed", "Label shown": display_label(o),
+                "Class": o["cls"] or "unidentified", "Label shown": display_label(o),
                 "Class named by": o.get("wall_rule") or o.get("named_by") or "no label votes",
                 "Type key": o["key"] or "(none)", "Type source": o["type_source"], "Label text": o["label_text"] or "",
                 "Length (cm)": round(f["length"] * 100), "Width (cm)": round(f["width"] * 100),
@@ -1308,8 +1346,8 @@ def write_workbook(path, objs, info, labels, m1, m2, log, ver, dpi, calib):
                       "x (px)": round(l["c"].x * s, 1), "y (px)": round(l["c"].y * s, 1),
                       "Pass 1 object": o1["id"] if o1 else "unmatched",
                       "Pass 1 cluster": o1["cluster"] if o1 else "",
-                      "Pass 1 cluster class": (o1["cls"] or "unnamed") if o1 else "",
-                      "Pass 1 agrees": ("yes" if o1["cls"] in want else ("unnamed" if o1["cls"] is None else "no")) if o1 else "",
+                      "Pass 1 cluster class": (o1["cls"] or "unidentified") if o1 else "",
+                      "Pass 1 agrees": ("yes" if o1["cls"] in want else ("unidentified" if o1["cls"] is None else "no")) if o1 else "",
                       "Pass 2 object": objs_by_index(p2)["id"] if p2 else "unmatched",
                       "Pass 2 distance (m)": p2[2][0] if p2 else None, "Pass 2 misalignment": p2[2][1] if p2 else None,
                       "Text direction found": "yes" if l["dir"] is not None else "no"})
@@ -1344,7 +1382,7 @@ def write_workbook(path, objs, info, labels, m1, m2, log, ver, dpi, calib):
             vals.append(c["votes"].get(kd, 0) + (c["votes"].get("strip_footing", 0) if False else 0))
         vstart, vend = get_column_letter(12), get_column_letter(11 + len(kinds))
         vals += [f"=SUM({vstart}{r}:{vend}{r})", f"=IFERROR(MAX({vstart}{r}:{vend}{r})/{get_column_letter(12 + len(kinds))}{r},0)",
-                 c["name"] or "unnamed", c["named_by"] or "no label votes", c["silhouette"]]
+                 c["name"] or "unidentified", c["named_by"] or "no label votes", c["silhouette"]]
         for ci, v in enumerate(vals, 1):
             cell = ws.cell(row=r, column=ci, value=v)
             cell.font = body
@@ -1411,7 +1449,7 @@ def write_workbook(path, objs, info, labels, m1, m2, log, ver, dpi, calib):
     classes = ["column", "shear_wall", "retaining_wall", "isolated_footing", "combined_footing", "crane_footing",
                "mass_concrete_pad"]
     got = ["column", "shear_wall", "retaining_wall", "isolated_footing", "combined_footing", "strip_footing",
-           "grade_beam", "raft", "sump_pit", "unnamed"]
+           "grade_beam", "raft", "sump_pit", "unidentified"]
     header(ws, 3, ["Verified class"] + got + ["Not found", "Total", "Correct"], [18] + [11] * (len(got) + 3))
     for r, vc in enumerate(classes, 4):
         ws.cell(row=r, column=1, value=vc).font = body
@@ -1433,7 +1471,7 @@ def write_workbook(path, objs, info, labels, m1, m2, log, ver, dpi, calib):
     ws.cell(row=rr + 2, column=1, value="Band widths found in the drawing").font = bold
     header(ws, rr + 3, ["Width (m)", "Paired line length (m)", "Share filled", "Cluster class"], [18, 16, 12, 18])
     for i, bf in enumerate(log["band_families"], rr + 4):
-        cl = next((c["name"] or "unnamed" for c in info if c["kind"] == f"band {bf['width']:.2f} m"), "")
+        cl = next((c["name"] or "unidentified" for c in info if c["kind"] == f"band {bf['width']:.2f} m"), "")
         for ci, v in enumerate([bf["width"], bf["paired_m"], bf["filled_share"], cl], 1):
             ws.cell(row=i, column=ci, value=v).font = body
     wb.calculation.fullCalcOnLoad = True
@@ -1457,7 +1495,7 @@ def display_label(o):
     """The text shown with an element: its class in words, its type (~ = inferred) and its measured
     size in metres (length x width of its box; a shape that is not a rectangle also gets its area)."""
     if not o["cls"]:
-        return f"C{o['cluster']}"
+        return group_of(o)
     key = o["key"] or ""
     if key and o["type_source"].startswith("inferred"):
         key = "~" + key
@@ -1472,6 +1510,52 @@ def display_label(o):
 ELEMENT_TYPE = {"column": "column", "shear_wall": "wall", "retaining_wall": "wall", "core_wall": "wall",
                 "isolated_footing": "footing", "combined_footing": "footing", "strip_footing": "footing",
                 "grade_beam": "beam", "raft": "slab_raft", "sump_pit": "other"}
+
+
+def group_of(o):
+    """The tag of an unidentified object's group: its cluster (similar shapes that no label named)."""
+    return f"C{o['cluster']}" if o.get("cluster") is not None else "C?"
+
+
+KIND_WORDS = {"solid": ("filled shape", "filled shapes"), "outline": ("closed outline", "closed outlines"),
+              "band": ("pair of parallel lines", "pairs of parallel lines"), "cross_hatch": ("cross-hatched area", "cross-hatched areas"),
+              "single_hatch": ("hatched area", "hatched areas"), "stamped_region": ("stamped region", "stamped regions")}
+
+
+def describe_group(members):
+    """What an unidentified group's members have in common, in words (geometry only)."""
+    kind = members[0]["kind"]
+    one, many = KIND_WORDS.get(kind, (kind, kind + "s"))
+    n = len(members)
+    rng = lambda vs: f"{min(vs):.2f}" if max(vs) - min(vs) <= G.size_tol else f"{min(vs):.2f}-{max(vs):.2f}"
+    Ls, Ws = [o["feat"]["length"] for o in members], [o["feat"]["width"] for o in members]
+    text = f"{n} {one if n == 1 else many}, " + (f"{rng(Ws)} m apart, {rng(Ls)} m long" if kind == "band"
+                                                 else f"{rng(Ls)} x {rng(Ws)} m")
+    facts = [("on a stamped region", "on_stamped_region"), ("inside a closed outline", "inside_outline"),
+             ("touching filled shapes", "touches_solid"), ("with a pattern inside", "dots_inside"),
+             ("with filled shapes inside", "solids_inside"), ("drawn as nested boxes", "nested_boxes"),
+             ("on the building edge", "on_perimeter")]
+    most = [words for words, f in facts if sum(1 for o in members if o["feat"].get(f)) > n / 2]
+    if kind == "band":
+        most.append("holding filled shapes" if sum(1 for o in members if o.get("holds")) > n / 2 else "empty")
+    return text + ("; " + ", ".join(most) if most else "")
+
+
+def unidentified_groups(objs, s):
+    px = lambda pts: [[round(x * s, 1), round(y * s, 1)] for x, y in pts]
+    groups = collections.defaultdict(list)
+    for o in objs:
+        if not o["cls"]:
+            groups[group_of(o)].append(o)
+    out = []
+    for g, members in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        out.append({"group": g, "drawing_kind": members[0]["kind"], "count": len(members),
+                    "description": describe_group(members),
+                    "members": [{"id": o["id"], "bbox_px": [round(v * s, 1) for v in o["g"].bounds],
+                                 "obb_px": px(o["o"]["obb"]) if o["o"] else None,
+                                 "size_m": {"length": round(o["feat"]["length"], 3), "width": round(o["feat"]["width"], 3)}}
+                                for o in members]})
+    return out
 
 
 def write_json(path, pdf, objs, calib, dpi):
@@ -1498,14 +1582,16 @@ def write_json(path, pdf, objs, calib, dpi):
             d["polygon_px"] = px(o["g"].exterior.coords)
         if o.get("net") is not None:
             d["net_length_m"] = round(o["net"], 2)
+        if o.get("nested"):
+            d["nested_boxes_m"] = [{"length": L, "width": W} for L, W in o["nested"]]
         dets.append(d)
     out = {"source_pdf": Path(pdf).name,
            "image": {"dpi": dpi, "width_px": round(page.rect.width * s), "height_px": round(page.rect.height * s),
                      "coordinates": "pixels of the page rendered at this dpi, origin top-left, y down"},
            "calibration": {"pt_per_m": round(calib["pt_per_m"], 4), "scale": f"1/{round(72 / 0.0254 / calib['pt_per_m'])}"},
            "counts": dict(collections.Counter(d["class"] for d in dets)),
-           "unnamed_objects": sum(1 for o in objs if not o["cls"]),
-           "detections": dets}
+           "detections": dets,
+           "unidentified_groups": unidentified_groups(objs, s)}
     Path(path).write_text(json.dumps(out, indent=1, ensure_ascii=False))
 
 
@@ -1544,10 +1630,12 @@ def write_pdf(pdf, out_path, objs):
     doc = pymupdf.open(pdf)
     page = doc[0]
     layers = {}
+    for name in sorted({o["cls"] for o in objs if o["cls"]}):
+        layers[name] = doc.add_ocg(f"GEO {name}", on=True)
+    for g in sorted({group_of(o) for o in objs if not o["cls"]}, key=lambda g: int(g[1:]) if g[1:].isdigit() else 1e9):
+        layers[g] = doc.add_ocg(f"GEO unidentified {g}", on=False)
     for o in objs:
-        name = o["cls"] or "unnamed"
-        if name not in layers:
-            layers[name] = doc.add_ocg(f"GEO {name}", on=name != "unnamed")
+        name = o["cls"] or group_of(o)
         col = CLASS_COLOURS.get(o["cls"], UNNAMED_COLOUR)
         if box_fits(o):
             pts = [pymupdf.Point(x, y) for x, y in o["o"]["obb"]]
@@ -1587,7 +1675,7 @@ def main():
     write_json(out / f"geometry_classes_v{v}.json", args.pdf, objs, calib, args.dpi)
     pymupdf.open(out / f"geometry_classes_v{v}.pdf")[0].get_pixmap(dpi=args.dpi).save(out / f"geometry_classes_v{v}.png")
     print(f"written out/geometry_classes_v{v}.xlsx, .pdf, .json and .png")
-    cls = collections.Counter(o["cls"] or "unnamed" for o in objs)
+    cls = collections.Counter(o["cls"] or "unidentified" for o in objs)
     print("objects:", len(objs), dict(cls))
     print("clusters:", len(info), "named:", sum(1 for c in info if c["name"]))
     print("joints:", log["joints"], "regions:", log["regions"])
@@ -1620,7 +1708,7 @@ def run(pdf, cfg, reference=None):
     usual_pens = {p for p, n in col_pens.items() if n >= G.pen_share * sum(col_pens.values())}
     solids_all = [o for o in objs if o["kind"] == "solid"]
     for o in objs:
-        if o["cls"] != "column":
+        if (o["cls"] or o.get("cluster_name")) != "column":
             continue
         continues_wall = any(q is not o and q["cls"] != "column" and q["g"].distance(o["g"]) < G.touch_m * k
                              and abs(q["feat"]["width"] - o["feat"]["width"]) <= G.width_tol for q in solids_all)

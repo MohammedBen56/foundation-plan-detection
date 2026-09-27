@@ -85,6 +85,19 @@ T = SimpleNamespace(
 # ---------------------------------------------------------------------------
 # Primitives
 # ---------------------------------------------------------------------------
+def valid_polygon(g):
+    """A shape made valid (a self-touching outline, a bow-tie from buffering) with its largest part
+    kept, so later unions and intersections cannot fail on it."""
+    if g is None or g.is_empty or g.is_valid:
+        return g
+    from shapely.validation import make_valid
+    fixed = make_valid(g)
+    parts = [q for q in getattr(fixed, "geoms", [fixed]) if q.geom_type == "Polygon" and not q.is_empty]
+    if not parts:                   # only lines or points left: fall back to the zero-width buffer trick
+        return g.buffer(0)
+    return max(parts, key=lambda q: q.area)
+
+
 def text_index(texts):
     boxes = [box(*t["rect"]).buffer(1.0) for t in texts]
     return boxes, STRtree(boxes)
@@ -314,7 +327,7 @@ def hatched_regions(segs, k):
                     if max(a, bb) > 2.5 * min(a, bb):  # a straight stretch, not a corner
                         samples.append(min(a, bb) / k)
         thickness = statistics.median(samples) if samples else None
-        region = b.buffer(-T.hatch_gap * k).buffer(0)
+        region = valid_polygon(b.buffer(-T.hatch_gap * k).buffer(0))
         region = max(getattr(region, "geoms", [region]), key=lambda g: g.area) if not region.is_empty else b.buffer(0)
         area = region.area / k ** 2
         out.append({"g": region, "strokes": len(members), "cross": cross,
