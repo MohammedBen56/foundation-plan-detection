@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
-"""Geometry-first classification of the elements on a foundation plan.
+"""Detect and classify the structural elements of a foundation plan (vector PDF from AutoCAD).
 
-1. objects   every drawn object from geometry alone: solid fills (grouped by paint order),
-             cross-hatched regions, closed outlines, bands (pairs of parallel lines, widths found
-             from the drawing itself), stamp circles with corner rays. No colour, layer or text.
-2. cluster   objects of the same drawing kind are clustered on geometric features (size,
-             shape, what they contain, what they touch). Still no text.
-3. match     labels are matched to objects by distance and text alignment in one global
-             assignment, whatever their type; a label may stay unmatched.
-4. name      each cluster takes the name of the label type most of its matched labels carry;
-             unlabelled members inherit it; labels that disagree are listed as conflicts.
-5. re-match  labels are matched again, now only to clusters of their own type, which gives
-             each element its type key (P1/124, V3/120, S7, ...); unlabelled members get an
-             inferred key (~key) from the types of their size.
-6. rules     unlabelled walls: along the building edge or on a strip footing -> retaining wall,
-             inside the building -> core wall; column-shaped pieces drawn like walls -> wall pieces.
+1. objects   every drawn object, from geometry alone: filled shapes (grouped by paint order),
+             hatched areas, closed outlines, bands (pairs of parallel lines drawn with the same
+             pen; the widths in use are found on the drawing), circle stamps with corner rays.
+2. cluster   objects of one drawing kind are clustered on geometric features (size, shape, what
+             they contain and touch, how they are drawn). Still no text.
+3. match     labels are matched to objects in one global assignment (distance and text
+             alignment), whatever their type; a label may stay unmatched.
+4. name      each cluster takes the class most of its matched labels name; a label type votes only
+             for the drawing kind its types come out size-consistent on.
+5. re-match  labels are matched again, only to objects of their own class, which gives each element
+             its type (P1/124, V3/120, S7, ...); unlabelled members get an inferred type (~key).
+6. rules     geometry rules that need no label: unlabelled walls along the building edge or on a
+             strip footing are retaining walls, other unlabelled walls core walls; column-shaped
+             pieces drawn like walls are wall pieces; without P labels, EN 1992 decides columns.
 
-Outputs out/geometry_classes_vN.xlsx, .pdf (one layer per class), .json (classes and pixel boxes)
-and .png, N being the next free version number, so earlier runs stay for comparison.
-Every tolerance is in G (this file) or T (element_stats.py), in metres or as a share; the plan's
-label wording is in plan_config.toml. No colour and no CAD layer is read to detect or classify.
-Requires out/detections.json from detect_structures.py for the validation columns only.
+Outputs, in --out:
+    annotated.pdf    the plan with one PDF layer per class (and one per unidentified group, off)
+    annotated.png    the same page rendered at --dpi; detections.json's pixels refer to it
+    detections.json  every element: class, type, label shown, size, pixel boxes
+
+All tolerances are in G (this file) and T (drawing.py), in metres or as shares; the plan's label
+wording is in plan_config.toml. No colour and no CAD layer is read.
 
 Usage
-    python geometry_classes.py "GHF_EXE_PLN_STR (1)-FONDATIONS (1).pdf" --out out
+    python detect_elements.py "GHF_EXE_PLN_STR (1)-FONDATIONS (1).pdf" --out out
 """
 import argparse
 import collections
@@ -45,8 +47,7 @@ from shapely.strtree import STRtree
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import silhouette_score
 
-import detect_structures as ds
-import element_stats as es
+import drawing as dr
 
 G = SimpleNamespace(
     area_buffer=15.0,          # objects farther than this from any solid fill are outside the drawing
@@ -55,12 +56,10 @@ G = SimpleNamespace(
     band_peak_min_m=15.0,      # a band width needs this much paired line length to count
     band_peak_share=0.01,
     band_tol=0.015,
-    band_empty=0.3,            # empty band: at most this share filled
     band_holds=(0.1, 0.9),     # band holding a solid: this share filled (the top only excludes a band that is the wall itself)
     hatch_spread=0.5,          # a hatched band has its strokes along most of its length (a column may fill one end)
     band_holding=0.15,         # a band family holding solids on average at least this share is a strip, not a beam
     outline_max_area=60.0,     # m2; larger closed outlines are frames, not elements
-    stamp_diameter=(0.8, 3.0),
     label_radius=1.5,
     unmatched_cost=3.5,        # a label left unmatched costs as much as one 1.75 m away
     align_weight=1.0,
@@ -142,8 +141,8 @@ FAMILY = {"column": "column", "shear_wall": "wall", "retaining_wall": "wall", "c
 # 1. Objects
 # ---------------------------------------------------------------------------
 def obj(kind, g, k, **extra):
-    g = es.valid_polygon(g)
-    o = ds.oriented(g, k) if g.geom_type == "Polygon" else None
+    g = dr.valid_polygon(g)
+    o = dr.oriented(g, k) if g.geom_type == "Polygon" else None
     d = {"kind": kind, "g": g, "geom": g, "o": o, "feat": {}, "label": None, "cluster": None, "cls": None}
     d.update(extra)
     return d
@@ -171,17 +170,17 @@ def band_pairs(segs, k, fill_tree, fill_geoms):
     out = []
     for i, s in enumerate(lines):
         ang = s["ang"]
-        ux, uy = es.axis(ang)
-        so = es.offset(s["a"], ang)
-        s_lo, s_hi = sorted((es.along(s["a"], ang), es.along(s["b"], ang)))
+        ux, uy = dr.axis(ang)
+        so = dr.offset(s["a"], ang)
+        s_lo, s_hi = sorted((dr.along(s["a"], ang), dr.along(s["b"], ang)))
         between = []
         for j in tree.query(s["g"].buffer(G.band_max * k)):
             t = lines[j]
             if j == i or abs(math.sin(t["ang"] - ang)) > 0.005:
                 continue
             t_mid = ((t["a"][0] + t["b"][0]) / 2, (t["a"][1] + t["b"][1]) / 2)
-            to = es.offset(t_mid, ang)
-            t_lo, t_hi = sorted((es.along(t["a"], ang), es.along(t["b"], ang)))
+            to = dr.offset(t_mid, ang)
+            t_lo, t_hi = sorted((dr.along(t["a"], ang), dr.along(t["b"], ang)))
             lo, hi = max(s_lo, t_lo), min(s_hi, t_hi)
             if (hi - lo) / k < G.overlap_min:
                 continue
@@ -218,7 +217,7 @@ def band_pairs(segs, k, fill_tree, fill_geoms):
                 top_dir, n_top = fam.most_common(1)[0]
                 # ... spread along the band's length: a dense pattern in one spot (a pad sitting on a
                 # beam) does not make the whole band a hatched wall
-                pos = [es.along(((t["a"][0] + t["b"][0]) / 2, (t["a"][1] + t["b"][1]) / 2), ang)
+                pos = [dr.along(((t["a"][0] + t["b"][0]) / 2, (t["a"][1] + t["b"][1]) / 2), ang)
                        for t in strokes if round(math.degrees(t["ang"]) / 5) == top_dir]
                 hatched = n_top >= 3 * (hi - lo) / k and max(pos) - min(pos) >= G.hatch_spread * (hi - lo)
             if hatched:
@@ -393,7 +392,7 @@ def stamp_rafts(paths, segs, k, solids=()):
         corners, dirs, rays = [], set(), []
         for i in tree.query(c.buffer(r + G.ray_search * k)):
             s = long_[i]
-            ux, uy = es.axis(s["ang"])
+            ux, uy = dr.axis(s["ang"])
             perp = abs(-(c.x - s["a"][0]) * uy + (c.y - s["a"][1]) * ux)
             da, db = math.dist(s["a"], (c.x, c.y)), math.dist(s["b"], (c.x, c.y))
             if perp < 0.3 * r and min(da, db) < r + G.ray_start * k and max(da, db) > G.ray_reach * k:
@@ -413,31 +412,31 @@ def stamp_rafts(paths, segs, k, solids=()):
 
 
 def objects(paths, texts, k):
-    tb = es.text_index(texts)
-    segs = es.straight_segments(paths, k, tb)
-    es.mark_dashed(segs, k)
+    tb = dr.text_index(texts)
+    segs = dr.straight_segments(paths, k, tb)
+    dr.mark_dashed(segs, k)
     log = {}
-    rects, dups, others = es.filled_objects(paths, k)
-    others = [es.valid_polygon(g) for g in others]
+    rects, dups, others = dr.filled_objects(paths, k)
+    others = [dr.valid_polygon(g) for g in others]
     solids = [r["g"] for r in rects]
     # walls drawn around corners as one object: fills no thicker than twice the usual solid width
     thin = 2 * statistics.median(r["o"]["width_m"] for r in rects) if rects else 0.4
     for g in others:
         area = g.area / k ** 2
         if area >= G.bent_fill_min_area and g.geom_type == "Polygon" and 2 * area / (g.length / k) <= thin:
-            for piece in es.straight_stretches(g, k):
+            for piece in dr.straight_stretches(g, k):
                 over = [s for s in solids if piece.intersection(s).area > 0]
                 if not any(piece.intersection(s).area > 0.5 * piece.area for s in over):
                     solids.append(piece)
                     continue
                 # the same wall drawn twice, but this drawing runs on past the other one: keep the
                 # stretch that sticks out (as long as it is a stretch of the wall, not a sliver)
-                w = ds.oriented(piece, k)["width_m"]
+                w = dr.oriented(piece, k)["width_m"]
                 rest = piece.difference(unary_union(over))
                 for part in getattr(rest, "geoms", [rest]):
                     if part.geom_type == "Polygon" and not part.is_empty:
-                        po = ds.oriented(part, k)
-                        if po["width_m"] >= 0.5 * w and po["length_m"] >= w and po["rectness"] > es.T.rectness:
+                        po = dr.oriented(part, k)
+                        if po["width_m"] >= 0.5 * w and po["length_m"] >= w and po["rectness"] > dr.T.rectness:
                             solids.append(part)
     log["solids"] = len(solids)
     out = [obj("solid", g, k) for g in solids]
@@ -445,7 +444,7 @@ def objects(paths, texts, k):
     # of the lines running along most of its border, whether drawn as one closed ring or as pieces
     # Only the object's own lines count: lines lying (almost) entirely along its border, so the
     # outline of a neighbouring wall that runs on past it does not.
-    strokes = [(ls, round(p["width"], 2)) for p in paths if p["type"] == "s" for ls in ds.path_lines(p)]
+    strokes = [(ls, round(p["width"], 2)) for p in paths if p["type"] == "s" for ls in dr.path_lines(p)]
     stree = STRtree([ls for ls, _ in strokes])
     for o in out:
         border = o["g"].exterior
@@ -461,7 +460,7 @@ def objects(paths, texts, k):
     top_pen = max((o["outline_pen"] for o in out), default=0) or 1.0
     for o in out:
         o["outline_pen_rel"] = o["outline_pen"] / top_pen
-    for h in es.hatched_regions(segs, k):
+    for h in dr.hatched_regions(segs, k):
         if h["length"] and h["length"] >= G.hatch_min_len:
             out.append(obj("cross_hatch" if h["cross"] else "single_hatch", h["g"], k, hatch=h))
     rafts = stamp_rafts(paths, segs, k, solids)
@@ -473,7 +472,7 @@ def objects(paths, texts, k):
     solid_list = [o for o in out if o["kind"] == "solid"]
     walls_u = unary_union([o["g"] for o in out if o["kind"] in ("solid", "cross_hatch")] +
                           [g for g in others if g.area > G.fill_min_area * k * k]).buffer(G.grow * k)
-    for c in es.closed_outlines(paths, k, tb):
+    for c in dr.closed_outlines(paths, k, tb):
         g = c["g"]
         area = g.area / k ** 2
         if area > G.outline_max_area:
@@ -489,7 +488,7 @@ def objects(paths, texts, k):
     # a hatched wall's straight legs: its two border lines with the hatch between them. A bent
     # hatched region (U, L, T of walls) is replaced by its legs, each one straight.
     legs = [dict(p, width=round(p["sp"], 2)) for p in pairs if p["hatched"] and p["adjacent"]]
-    runs = es.band_runs(legs, k) if legs else []
+    runs = dr.band_runs(legs, k) if legs else []
     hatch_objs = [o for o in out if o["kind"] == "cross_hatch"]
     for h in hatch_objs:
         mine = [r for r in runs if r["poly"].intersection(h["g"]).area > 0.5 * r["poly"].area]
@@ -502,7 +501,7 @@ def objects(paths, texts, k):
                 kept_legs.append(r["poly"])
         out.remove(h)
         for leg in kept_legs:
-            hh = dict(h["hatch"], thickness=min(ds.oriented(leg, k)["width_m"], 1.0), length=ds.oriented(leg, k)["length_m"])
+            hh = dict(h["hatch"], thickness=min(dr.oriented(leg, k)["width_m"], 1.0), length=dr.oriented(leg, k)["length_m"])
             out.append(obj("cross_hatch", leg, k, hatch=hh, leg_of_region=True))
     log["hatched_legs"] = sum(1 for o in out if o.get("leg_of_region"))
     # one wall drawn twice, filled and hatched over the same stretch: the hatched object is that
@@ -520,7 +519,7 @@ def objects(paths, texts, k):
                 u = h["o"]["obb"] and unary_union([s["g"], Polygon(h["o"]["obb"])])
                 u = u if u.geom_type == "Polygon" else u.buffer(G.fuse * k).buffer(-G.fuse * k)
                 if u.geom_type == "Polygon":
-                    s.update(g=u, geom=u, o=ds.oriented(u, k), drawn_twice=True)
+                    s.update(g=u, geom=u, o=dr.oriented(u, k), drawn_twice=True)
                     out.remove(h)
                     merged += 1
                     break
@@ -573,7 +572,7 @@ def objects(paths, texts, k):
     outl = [o["g"] for o in out if o["kind"] == "outline"]
     outl_tree = STRtree(outl) if outl else None
     for f in fams:
-        for run in es.band_runs(f["pieces"], k):
+        for run in dr.band_runs(f["pieces"], k):
             # the element as drawn: the whole run. Its net length leaves out the outlines it crosses
             # (a beam through a footing is footing concrete there).
             crossed = unary_union([outl[i] for i in outl_tree.query(run["poly"])]) if outl_tree is not None else None
@@ -584,7 +583,7 @@ def objects(paths, texts, k):
     body = unary_union([o["g"] for o in out if o["kind"] == "solid"]).buffer(G.area_buffer * k)
     inside = [o for o in out if body.contains(o["g"].centroid)]
     log["outside_drawing"] = dict(collections.Counter(o["kind"] for o in out if o not in inside))
-    tiny = [ds.centre(p["rect"]) for p in paths if max(p["rect"][2] - p["rect"][0], p["rect"][3] - p["rect"][1]) < G.dot_max * k]
+    tiny = [dr.centre(p["rect"]) for p in paths if max(p["rect"][2] - p["rect"][0], p["rect"][3] - p["rect"][1]) < G.dot_max * k]
     return inside, segs, tiny, log
 
 
@@ -594,7 +593,6 @@ def objects(paths, texts, k):
 def perimeter_flags(objs, k):
     """Walls running along the building's outer edge: close to the footprint's boundary (walls and
     columns, grown and closed) and parallel to it there."""
-    from shapely.ops import nearest_points
     sol = [o["g"] for o in objs if o["kind"] in ("solid", "cross_hatch")]
     body = unary_union([g.buffer(G.footprint_grow * k) for g in sol]).buffer(G.footprint_close * k).buffer(-G.footprint_close * k)
     rings = [r for poly in getattr(body, "geoms", [body]) for r in [poly.exterior] + list(poly.interiors)]
@@ -616,13 +614,12 @@ def perimeter_flags(objs, k):
             o["feat"]["on_perimeter"] = 1
 
 
-def features(objs, tiny, k, circ=()):
+def features(objs, tiny, k):
     solids = [o for o in objs if o["kind"] == "solid"]
     outlines = [o for o in objs if o["kind"] == "outline"]
     hold = [o for o in objs if o["kind"] == "band" and o["holds"]]
     empty = [o for o in objs if o["kind"] == "band" and not o["holds"]]
     stamped = [o for o in objs if o["kind"] == "stamped_region"]
-    hatch = [o for o in objs if o["kind"] == "cross_hatch"]
     hold_u = unary_union([o["g"] for o in hold]) if hold else None
     tiny_tree = STRtree(tiny)
     s_tree, o_tree, e_tree = STRtree([o["g"] for o in solids]), STRtree([o["g"] for o in outlines]), STRtree([o["g"] for o in empty])
@@ -646,10 +643,8 @@ def features(objs, tiny, k, circ=()):
                                          and hold_u.intersection(g).area > 0.5 * g.area)
         f["empty_bands_touching"] = sum(1 for i in e_tree.query(g.buffer(G.near * k)) if empty[i] is not o)
         f["on_stamped_region"] = int(any(r["g"].buffer(G.on_region * k).contains(g.centroid) for r in stamped if r is not o))
-        f["touches_cross_hatch"] = int(any(h["g"].distance(g) < G.near * k for h in hatch if h is not o))
         f["outline_pen"] = o.get("outline_pen_rel", 0.0)
         f["nested_boxes"] = int(bool(o.get("nested")))       # drawn as boxes inside one another
-        f["stamp_inside"] = int(o["kind"] == "outline" and any(g.contains(c) and c.buffer(r).within(g) for c, r in circ))
     perimeter_flags(objs, k)
 
 
@@ -671,12 +666,12 @@ def matrix(objs, spec):
         f = o["feat"]
         L, W = round(f["length"] * 100), round(f["width"] * 100)
         v = {"log_length": math.log(max(f["length"], 0.05)), "log_width": math.log(max(f["width"], 0.05)),
-             "log_aspect": math.log(max(f["aspect"], 1.0)), "ec2_column": 1.0 if W and L <= es.T.ec2_ratio * W else 0.0,
+             "log_aspect": math.log(max(f["aspect"], 1.0)), "ec2_column": 1.0 if W and L <= dr.T.ec2_ratio * W else 0.0,
              "touches_solid": min(f["touches_solid"], 2) / 2,
              "inside_outline": f["inside_outline"], "in_band_holding_solid": f["in_band_holding_solid"],
              "on_stamped_region": f["on_stamped_region"], "solids_inside": min(f["solids_inside"], 3) / 3,
              "log_dots": min(math.log1p(f["dots_inside"]) / 4, 1.0),
-             "empty_bands_touching": min(f["empty_bands_touching"], 3) / 3, "stamp_inside": f.get("stamp_inside", 0),
+             "empty_bands_touching": min(f["empty_bands_touching"], 3) / 3,
              "outline_pen": f.get("outline_pen", 0.0), "on_perimeter": f.get("on_perimeter", 0),
              "nested_boxes": f.get("nested_boxes", 0)}
         rows.append([v[n] for n, _ in spec])
@@ -736,7 +731,7 @@ def cluster(objs):
 # 3. Labels and matching
 # ---------------------------------------------------------------------------
 def read_labels(texts, paths, cfg, k, tb):
-    labels = es.all_labels(texts, cfg)
+    labels = dr.all_labels(texts, cfg)
     for l in labels:
         if l["kind"] == "footing":
             l["kind"] = "footing:" + l["groups"]["series"]
@@ -745,16 +740,16 @@ def read_labels(texts, paths, cfg, k, tb):
     nums = [t for t in texts if re.fullmatch(rr["number"], t["text"])]
     for t in texts:
         if re.search(rr["pattern"], t["text"]) and not (rr.get("exclude") and re.search(rr["exclude"], t["text"])):
-            c = ds.centre(t["rect"])
+            c = dr.centre(t["rect"])
             m = re.search(rr["thickness"], t["text"])
             thick = m.group(1) if m else None
             if thick is None and nums:     # the stamp's number sits right under the word
-                n = min(nums, key=lambda n: ds.centre(n["rect"]).distance(c))
-                thick = n["text"] if ds.centre(n["rect"]).distance(c) < G.label_radius * k else None
+                n = min(nums, key=lambda n: dr.centre(n["rect"]).distance(c))
+                thick = n["text"] if dr.centre(n["rect"]).distance(c) < G.label_radius * k else None
             labels.append({"kind": "raft", "raw": t["text"], "c": c, "key": f"{rr['key']} {thick}" if thick else rr["key"],
                            "groups": {}, "building": None, "dims": None})
         if re.search(pr["pattern"], t["text"]):
-            labels.append({"kind": "pit", "raw": t["text"], "c": ds.centre(t["rect"]), "key": pr["key"],
+            labels.append({"kind": "pit", "raw": t["text"], "c": dr.centre(t["rect"]), "key": pr["key"],
                            "groups": {}, "building": None, "dims": None})
     # one text naming two stacked elements ('VP20-SF1 80x25': the wall and the strip under it)
     merged, used = [], set()
@@ -767,10 +762,10 @@ def read_labels(texts, paths, cfg, k, tb):
             merged.append(dict(a, kind="retaining_wall+strip_footing", key=b["key"], parts={"retaining_wall": a, "strip_footing": b}))
     labels = [l for l in labels if id(l) not in used] + merged
     # text direction from the glyph strokes inside each label's box
-    glyphs = [s for p in paths if p["type"] == "s" for s in ds.path_lines(p)]
+    glyphs = [s for p in paths if p["type"] == "s" for s in dr.path_lines(p)]
     gtree = STRtree(glyphs)
     for l in labels:
-        t = next((t for t in texts if t["text"] == l["raw"] and ds.centre(t["rect"]).equals(l["c"])), None)
+        t = next((t for t in texts if t["text"] == l["raw"] and dr.centre(t["rect"]).equals(l["c"])), None)
         l["dir"] = None
         if t is None:
             continue
@@ -992,11 +987,11 @@ def joints(segs, k):
         for b in long_[i + 1:]:
             if a["w"] != b["w"] or abs(math.sin(a["ang"] - b["ang"])) > 0.005:
                 continue
-            gap = abs(es.offset(((b["a"][0] + b["b"][0]) / 2, (b["a"][1] + b["b"][1]) / 2), a["ang"]) - es.offset(a["a"], a["ang"])) / k
+            gap = abs(dr.offset(((b["a"][0] + b["b"][0]) / 2, (b["a"][1] + b["b"][1]) / 2), a["ang"]) - dr.offset(a["a"], a["ang"])) / k
             if not G.joint_gap[0] <= gap <= G.joint_gap[1]:
                 continue
-            la = sorted((es.along(a["a"], a["ang"]), es.along(a["b"], a["ang"])))
-            lb = sorted((es.along(b["a"], a["ang"]), es.along(b["b"], a["ang"])))
+            la = sorted((dr.along(a["a"], a["ang"]), dr.along(a["b"], a["ang"])))
+            lb = sorted((dr.along(b["a"], a["ang"]), dr.along(b["b"], a["ang"])))
             if min(la[1], lb[1]) - max(la[0], lb[0]) > 0.8 * min(la[1] - la[0], lb[1] - lb[0]):
                 out.append(unary_union([a["g"], b["g"]]))
     return out
@@ -1056,7 +1051,7 @@ def assign_types(objs, labels, m2, k, cfg, regions=None):
             if o["key"] is None or cost < o["label_cost"]:
                 o.update(key=src["key"], label_text=l["raw"], label_cost=cost, label_d=d, label_mis=mis,
                          label_src=src, type_source="printed label")
-    blds = es.Buildings([l for l in labels if l.get("building")], k)
+    blds = dr.Buildings([l for l in labels if l.get("building")], k)
     for o in objs:
         own = (o["label_src"] or {}).get("groups", {}).get("bld") if o["label_src"] else None
         c = o["g"].centroid
@@ -1064,7 +1059,7 @@ def assign_types(objs, labels, m2, k, cfg, regions=None):
         if reg is not None and reg["building"]:
             where, src = reg["building"], "region between joints"
         elif reg is not None and reg["labels"]:
-            where, conf = es.Buildings(reg["labels"], k).of(c)
+            where, conf = dr.Buildings(reg["labels"], k).of(c)
             src = "nearest labels in its region"
         else:
             where, conf = blds.of(c)
@@ -1162,328 +1157,19 @@ def assign_types(objs, labels, m2, k, cfg, regions=None):
             o["type_source"] = f"no {o['cls']} type{where} has this size"
 
 
-def validate(objs, ref_path, k):
-    refs = es.load_reference(ref_path, k)
-    rows = []
-    for r in refs:
-        if r["subclass"] in ("wall_network", "crane_foundation"):
-            continue
-        best, bo = 0.0, None
-        for o in objs:
-            if o["g"].intersects(r["g"]):
-                iou = o["g"].intersection(r["g"]).area / o["g"].union(r["g"]).area
-                if iou > best:
-                    best, bo = iou, o
-        if bo is not None and best > 0.8:
-            bo["verified"] = r["subclass"]
-        rows.append((r["subclass"], bo["cls"] if bo is not None and best > 0.8 else "not found"))
-    return rows
 
 
 # ---------------------------------------------------------------------------
 # 5. Outputs
 # ---------------------------------------------------------------------------
-OBJ_COLS = [("ID", 6), ("Building", 9), ("Building from", 22), ("Drawing kind", 14), ("Cluster", 8), ("Class", 17),
-            ("Label shown", 34), ("Class named by", 26),
-            ("Type key", 14), ("Type source", 30), ("Label text", 20), ("Length (cm)", 9), ("Width (cm)", 9), ("L/W", 7),
-            ("Area (m²)", 9), ("Angle (°)", 8), ("Touches solids", 8), ("Inside an outline", 8), ("In a strip band", 8),
-            ("On a stamped region", 8), ("On the building edge", 8), ("Solids inside", 8), ("Dots inside", 8), ("Beams touching", 8), ("Net length (m)", 9), ("Extent", 14),
-            ("bbox x0 (px)", 9), ("bbox y0 (px)", 9), ("bbox x1 (px)", 9), ("bbox y1 (px)", 9),
-            ("(validation) verified class", 16), ("(validation) agrees", 10)]
-VERIFIED_TO_CLASS = {"column": "column", "shear_wall": "shear_wall", "retaining_wall": "retaining_wall",
-                     "isolated_footing": "isolated_footing", "combined_footing": "combined_footing",
-                     "crane_footing": "isolated_footing", "mass_concrete_pad": None}
 
 
-def cletter(cols, name):
-    from openpyxl.utils import get_column_letter
-    return get_column_letter([c for c, _ in cols].index(name) + 1)
 
 
-def write_workbook(path, objs, info, labels, m1, m2, log, ver, dpi, calib):
-    from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.utils import get_column_letter
-    F = "Arial"
-    hf, hfill = Font(name=F, bold=True, color="FFFFFF"), PatternFill("solid", fgColor="2F4F6F")
-    body, bold, title = Font(name=F, size=10), Font(name=F, size=10, bold=True), Font(name=F, size=14, bold=True)
-    note = Font(name=F, size=9, italic=True)
-    wrap = Alignment(wrap_text=True, vertical="top")
-
-    def header(ws, row, names, widths=None, col0=1):
-        for i, n in enumerate(names):
-            c = ws.cell(row=row, column=col0 + i, value=n)
-            c.font, c.fill, c.alignment = hf, hfill, Alignment(wrap_text=True, vertical="center")
-            if widths:
-                ws.column_dimensions[get_column_letter(col0 + i)].width = widths[i]
-        ws.row_dimensions[row].height = 30
-
-    s = dpi / 72
-    k = calib["pt_per_m"]
-    wb = Workbook()
-    order = {c: i for i, c in enumerate(["column", "shear_wall", "core_wall", "retaining_wall", "isolated_footing", "combined_footing",
-                                         "strip_footing", "grade_beam", "raft", "sump_pit"])}
-    objs = sorted(objs, key=lambda o: (str(o["building"]), order.get(o["cls"], 99), str(o["cls"]), str(o["key"])))
-    for n, o in enumerate(objs, 1):
-        o["id"] = n
-    cinfo = {c["id"]: c for c in info}
-    N = len(objs) + 1
-    OE = lambda name: f"Objects!${cletter(OBJ_COLS, name)}$2:${cletter(OBJ_COLS, name)}${N}"
-
-    # --- README ---
-    ws = wb.active
-    ws.title = "README"
-    text = [
-        ("Geometry-first classification", title), ("", body),
-        ("How each element got its class", bold),
-        ("1. Objects were found from geometry only: solid fills (pieces grouped by the order they are drawn in), "
-         "cross-hatched regions, closed outlines, bands (pairs of parallel lines; the widths come from the drawing "
-         "itself) and circle stamps with corner rays. No colour, no layer, no text.", body),
-        ("2. Objects of the same drawing kind were clustered on geometric features only: length, width, the ratio of the "
-         "two (log), the EN 1992-1-1 5.3.1(7) section test (long side <= 4 x short side = column-shaped), whether it "
-         "touches another solid, lies inside a closed outline, stands in a strip band or on a raft, and the pen of the "
-         "outline drawn around it (none / thin / thick, relative to the thickest on the sheet). For outlines: length, "
-         "width, how many solids and stipple dots are inside, how many beams touch it. 'Similar' means close in these "
-         "features after scaling, not the same dimensions. Deliberately more clusters than classes.", body),
-        ("3. Every label was matched to one object by distance and text alignment, in one global assignment that "
-         "ignores what the label says; a label may stay unmatched.", body),
-        (f"4. A cluster takes the class that most of its matched labels name (>= {G.name_min_votes} votes for it, at "
-         f"least {G.name_margin} x the runner-up, with labels on >= {G.name_min_labelled:.0%} of its members, or a small "
-         "clear vote of 2 or more with labels on 30% of its members). A cluster without enough labels takes the name of the most "
-         f"similar named cluster of the same drawing kind (feature distance <= {G.similar_max}), else stays unnamed. "
-         "Unlabelled members inherit their cluster's class - that is how unlabelled walls became walls.", body),
-        ("5. Labels were matched again, now only to objects of the class they name (or unnamed ones, at a cost), "
-         "penalising an object whose size differs from the size its type has where a label sits right on its element, "
-         "or that lies between expansion joints of another building. That gives the type keys (P1/124, V3/120, S7...).", body),
-        ("6. An unlabelled member of a class takes the type of its class (and building, where sizes vary per building) "
-         "that has its size: '~P1/124' when one type fits, '~V2/123|V4/123' when several share the size (nearest first). "
-         "When none fits, the type source says so: for a 'column' that is a sign it is not a column.", body),
-        ("7. Buildings: the footprint is cut along the expansion joints (pairs of long lines a few cm apart); a region "
-         "whose labels agree is one building. Elsewhere the nearest building-numbered labels within the region decide.", body),
-        ("8. A printed label whose element's size differs from the size its type has on at least two other elements "
-         "is re-typed from the types of the building region the element stands in (then its label's building), else "
-         "'?'. Two elements of a type that disagree are both flagged 'conflict'.", body),
-        ("9. Unlabelled walls (solid or hatched): along the building edge (close and parallel to the footprint's "
-         "boundary) or standing on a strip footing they are retaining walls; inside the building, when no V type has their size, core walls. A "
-         "column-cluster member without a label stays a column unless it is drawn unlike the labelled columns (an "
-         "outline pen none of them has) or continues a wall of the same thickness; then it is a wall piece.", body),
-        ("", body),
-        ("A label type only votes for its home drawing kind - the one it lands on most in the neutral pass (learned "
-         "from the drawing: P and V labels land on solids, LG and SF labels on bands, S labels on outlines).", body),
-        ("", body),
-        ("What labels do and do not decide", bold),
-        ("A single label never decides an object's class: it votes for its cluster, and its object keeps the "
-         "cluster's class even if the label disagrees. Disagreeing labels are listed on 'Conflicts' - each is a "
-         "wrong label, a wrongly placed label, or a geometry mistake worth a look.", body),
-        ("Clusters no label votes for (cross-hatched walls, small stippled squares, several band widths) keep a "
-         "descriptive geometric name; naming them is an interpretation, not something the plan states.", body),
-        ("", body),
-        ("Sheets", bold),
-        ("Summary by building - counts and sizes per building, class and type (formulas over 'Objects').", body),
-        ("Clusters - every geometric cluster, its size ranges, the label votes it received and the name it took.", body),
-        ("Objects - every object with its class, type, measurements, features and pixel box (page at 150 dpi).", body),
-        ("Labels - every label: what it names, where the first (neutral) pass put it, whether that agreed, and the "
-         "second-pass match.", body),
-        ("Conflicts - labels that disagreed with their object's cluster, and labels left unmatched.", body),
-        ("Validation - geometric classes against the verified, colour-based detections.", body),
-        ("", body),
-        (f"Scale 1/{calib['scale_denominator']:.1f}, from {calib['inliers']} dimension texts (median error "
-         f"{calib['median_error_cm']:.2f} cm). Formulas recalculate on opening; they were checked with the Python "
-         "'formulas' engine.", body),
-    ]
-    for i, (t, f) in enumerate(text, 1):
-        c = ws.cell(row=i, column=1, value=t)
-        c.font, c.alignment = f, wrap
-    ws.column_dimensions["A"].width = 130
-
-    # --- Objects ---
-    ws = wb.create_sheet("Objects")
-    header(ws, 1, [c for c, _ in OBJ_COLS], [w for _, w in OBJ_COLS])
-    Lc, Wc = cletter(OBJ_COLS, "Length (cm)"), cletter(OBJ_COLS, "Width (cm)")
-    Cc, Vc = cletter(OBJ_COLS, "Class"), cletter(OBJ_COLS, "(validation) verified class")
-    for r, o in enumerate(objs, 2):
-        f = o["feat"]
-        x0, y0, x1, y1 = o["g"].bounds
-        c = cinfo[o["cluster"]]
-        vals = {"ID": o["id"], "Building": o["building"] or "unknown", "Building from": o.get("building_source", ""),
-                "Drawing kind": o["kind"], "Cluster": o["cluster"],
-                "Class": o["cls"] or "unidentified", "Label shown": display_label(o),
-                "Class named by": o.get("wall_rule") or o.get("named_by") or "no label votes",
-                "Type key": o["key"] or "(none)", "Type source": o["type_source"], "Label text": o["label_text"] or "",
-                "Length (cm)": round(f["length"] * 100), "Width (cm)": round(f["width"] * 100),
-                "L/W": f'=IF(AND(ISNUMBER({Lc}{r}),{Wc}{r}>0),{Lc}{r}/{Wc}{r},"")',
-                "Area (m²)": round(f["area"], 3), "Angle (°)": round(o["o"]["angle_deg"], 1) if o["o"] else None,
-                "Touches solids": f["touches_solid"], "Inside an outline": f["inside_outline"],
-                "In a strip band": f["in_band_holding_solid"], "On a stamped region": f["on_stamped_region"],
-                "On the building edge": f.get("on_perimeter", 0),
-                "Solids inside": f["solids_inside"], "Dots inside": f["dots_inside"], "Beams touching": f["empty_bands_touching"],
-                "Net length (m)": round(o["net"], 2) if o.get("net") is not None else None,
-                "Extent": ("traced outline" if o.get("traced") else "diagonals' rectangle (no closed outline drawn)")
-                if o["kind"] == "stamped_region" else "",
-                "bbox x0 (px)": round(x0 * s, 1), "bbox y0 (px)": round(y0 * s, 1), "bbox x1 (px)": round(x1 * s, 1),
-                "bbox y1 (px)": round(y1 * s, 1), "(validation) verified class": o.get("verified", ""),
-                "(validation) agrees": (f'=IF({Vc}{r}="","",IF(OR({Vc}{r}={Cc}{r},AND({Vc}{r}="crane_footing",'
-                                        f'{Cc}{r}="isolated_footing")),"yes","no"))')}
-        for ci, (name, _) in enumerate(OBJ_COLS, 1):
-            ws.cell(row=r, column=ci, value=vals[name]).font = body
-        ws.cell(row=r, column=[c for c, _ in OBJ_COLS].index("L/W") + 1).number_format = "0.00"
-    ws.freeze_panes = "E2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(OBJ_COLS))}{N}"
-
-    # --- Labels ---
-    ws = wb.create_sheet("Labels")
-    LCOLS = [("Label", 5), ("Text", 20), ("Kind", 22), ("Names class", 26), ("x (px)", 8), ("y (px)", 8),
-             ("Pass 1 object", 8), ("Pass 1 cluster", 8), ("Pass 1 cluster class", 17), ("Pass 1 agrees", 9),
-             ("Pass 2 object", 8), ("Pass 2 distance (m)", 9), ("Pass 2 misalignment", 9), ("Text direction found", 9)]
-    header(ws, 1, [c for c, _ in LCOLS], [w for _, w in LCOLS])
-    lrows = []
-    for li, l in enumerate(labels):
-        want = wanted(l)
-        p1 = m1.get(li)
-        p2 = m2.get(li)
-        o1 = objs_by_index(p1)
-        lrows.append({"Label": li + 1, "Text": l["raw"], "Kind": l["kind"], "Names class": " / ".join(sorted(want)),
-                      "x (px)": round(l["c"].x * s, 1), "y (px)": round(l["c"].y * s, 1),
-                      "Pass 1 object": o1["id"] if o1 else "unmatched",
-                      "Pass 1 cluster": o1["cluster"] if o1 else "",
-                      "Pass 1 cluster class": (o1["cls"] or "unidentified") if o1 else "",
-                      "Pass 1 agrees": ("yes" if o1["cls"] in want else ("unidentified" if o1["cls"] is None else "no")) if o1 else "",
-                      "Pass 2 object": objs_by_index(p2)["id"] if p2 else "unmatched",
-                      "Pass 2 distance (m)": p2[2][0] if p2 else None, "Pass 2 misalignment": p2[2][1] if p2 else None,
-                      "Text direction found": "yes" if l["dir"] is not None else "no"})
-    for r, row in enumerate(lrows, 2):
-        for ci, (name, _) in enumerate(LCOLS, 1):
-            ws.cell(row=r, column=ci, value=row[name]).font = body
-    NL = len(lrows) + 1
-    LE = lambda name: f"Labels!${cletter(LCOLS, name)}$2:${cletter(LCOLS, name)}${NL}"
-    ws.freeze_panes = "C2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(LCOLS))}{NL}"
-
-    # --- Clusters ---
-    ws = wb.create_sheet("Clusters", 1)
-    kinds = sorted({l["kind"] for l in labels})
-    CC = ["Cluster", "Drawing kind", "Members", "Length min (cm)", "Length max (cm)", "Width min (cm)", "Width max (cm)",
-          "Touch solids", "Inside an outline", "In a strip band", "On a stamped region"] + \
-         [f"Votes: {kd}" for kd in kinds] + ["Votes total", "Top share", "Class", "Named by", "Silhouette"]
-    header(ws, 1, CC, [8, 16, 8, 9, 9, 9, 9, 9, 9, 9, 9] + [9] * len(kinds) + [8, 8, 17, 30, 9])
-    for r, c in enumerate(info, 2):
-        ms = [o for o in objs if o["cluster"] == c["id"]]
-        cl = lambda n: cletter(OBJ_COLS, n)
-        crit = f'{OE("Cluster")},$A{r}'
-        vals = [c["id"], c["kind"], f"=COUNTIFS({crit})",
-                f'=_xlfn.MINIFS({OE("Length (cm)")},{crit})', f'=_xlfn.MAXIFS({OE("Length (cm)")},{crit})',
-                f'=_xlfn.MINIFS({OE("Width (cm)")},{crit})', f'=_xlfn.MAXIFS({OE("Width (cm)")},{crit})',
-                f'=IFERROR(COUNTIFS({crit},{OE("Touches solids")},">0")/$C{r},0)',
-                f'=IFERROR(COUNTIFS({crit},{OE("Inside an outline")},1)/$C{r},0)',
-                f'=IFERROR(COUNTIFS({crit},{OE("In a strip band")},1)/$C{r},0)',
-                f'=IFERROR(COUNTIFS({crit},{OE("On a stamped region")},1)/$C{r},0)']
-        # votes counted from the label sheet, compound labels speaking for two objects included
-        for kd in kinds:
-            vals.append(c["votes"].get(kd, 0) + (c["votes"].get("strip_footing", 0) if False else 0))
-        vstart, vend = get_column_letter(12), get_column_letter(11 + len(kinds))
-        vals += [f"=SUM({vstart}{r}:{vend}{r})", f"=IFERROR(MAX({vstart}{r}:{vend}{r})/{get_column_letter(12 + len(kinds))}{r},0)",
-                 c["name"] or "unidentified", c["named_by"] or "no label votes", c["silhouette"]]
-        for ci, v in enumerate(vals, 1):
-            cell = ws.cell(row=r, column=ci, value=v)
-            cell.font = body
-        for ci in (8, 9, 10, 11, 13 + len(kinds)):
-            ws.cell(row=r, column=ci).number_format = "0%"
-    nr = len(info) + 3
-    ws.cell(row=nr, column=1, value="Votes are the first, neutral pass (program output). A 'VP..-SF..' label votes for the strip it "
-                                    "sits on and for the wall standing in that strip.").font = note
-    ws.freeze_panes = "C2"
-
-    # --- Summary by building ---
-    ws = wb.create_sheet("Summary by building", 1)
-    SC = ["Building", "Class", "Type key", "Count", "Length min (cm)", "Length max (cm)", "Width min (cm)",
-          "Width max (cm)", "Same section?", "Total length (m)", "Of which typed by inference"]
-    header(ws, 1, SC, [9, 17, 16, 7, 9, 9, 9, 9, 13, 10, 11])
-    main = [o for o in objs if o["cls"]]
-    combos = sorted({(str(o["building"] or "unknown"), o["cls"], o["key"] or "(none)") for o in main},
-                    key=lambda t: (t[0], order.get(t[1], 99), t[2]))
-    for r, (b, cls, key) in enumerate(combos, 2):
-        crit = f'{OE("Building")},$A{r},{OE("Class")},$B{r},{OE("Type key")},$C{r}'
-        vals = [b, cls, key, f"=COUNTIFS({crit})",
-                f'=_xlfn.MINIFS({OE("Length (cm)")},{crit})', f'=_xlfn.MAXIFS({OE("Length (cm)")},{crit})',
-                f'=_xlfn.MINIFS({OE("Width (cm)")},{crit})', f'=_xlfn.MAXIFS({OE("Width (cm)")},{crit})',
-                (f'=IF(OR(C{r}="(none)",B{r}="raft",B{r}="sump_pit"),"n/a",IF(OR(B{r}="column",B{r}="shear_wall",'
-                 f'B{r}="isolated_footing",B{r}="combined_footing"),IF(AND(F{r}-E{r}<=3,H{r}-G{r}<=3),"yes","no"),'
-                 f'IF(H{r}-G{r}<=3,"yes (thickness)","no (thickness)")))'),
-                f'=SUMIFS({OE("Length (cm)")},{crit})/100',
-                f'=COUNTIFS({crit},{OE("Type source")},"inferred*")']
-        for ci, v in enumerate(vals, 1):
-            ws.cell(row=r, column=ci, value=v).font = body
-        ws.cell(row=r, column=10).number_format = "0.0"
-    last = len(combos) + 1
-    ws.cell(row=last + 2, column=1, value="All").font = bold
-    ws.cell(row=last + 2, column=4, value=f"=SUM(D2:D{last})").font = bold
-    ws.cell(row=last + 3, column=1, value="Unnamed clusters are not listed here (see 'Clusters'). 'Same section?' allows 3 cm; "
-                                          "columns, shear walls and footings compare length and width, walls and bands of "
-                                          "varying length compare thickness only.").font = note
-    ws.freeze_panes = "D2"
-    ws.auto_filter.ref = f"A1:K{last}"
-
-    # --- Conflicts ---
-    ws = wb.create_sheet("Conflicts")
-    CF = ["Label", "Text", "Names class", "x (px)", "y (px)", "Issue", "Object it sits by (pass 1)",
-          "That object's class", "Pass 2 result"]
-    header(ws, 1, CF, [6, 20, 24, 8, 8, 44, 10, 17, 16])
-    r = 2
-    for row in lrows:
-        issue = None
-        if row["Pass 1 agrees"] == "no":
-            issue = "first, neutral pass put it on an object of another class"
-        if row["Pass 2 object"] == "unmatched":
-            issue = (issue + "; " if issue else "") + "no object of its class within reach in the second pass"
-        if issue:
-            for ci, v in enumerate([row["Label"], row["Text"], row["Names class"], row["x (px)"], row["y (px)"], issue,
-                                    row["Pass 1 object"], row["Pass 1 cluster class"], row["Pass 2 object"]], 1):
-                ws.cell(row=r, column=ci, value=v).font = body
-            r += 1
-    ws.freeze_panes = "C2"
-
-    # --- Validation ---
-    ws = wb.create_sheet("Validation")
-    ws["A1"] = "Geometric classes against the verified (colour-based) detections"
-    ws["A1"].font = title
-    classes = ["column", "shear_wall", "retaining_wall", "isolated_footing", "combined_footing", "crane_footing",
-               "mass_concrete_pad"]
-    got = ["column", "shear_wall", "retaining_wall", "isolated_footing", "combined_footing", "strip_footing",
-           "grade_beam", "raft", "sump_pit", "unidentified"]
-    header(ws, 3, ["Verified class"] + got + ["Not found", "Total", "Correct"], [18] + [11] * (len(got) + 3))
-    for r, vc in enumerate(classes, 4):
-        ws.cell(row=r, column=1, value=vc).font = body
-        for ci, g in enumerate(got, 2):
-            ws.cell(row=r, column=ci, value=f'=COUNTIFS({OE("(validation) verified class")},$A{r},{OE("Class")},'
-                                            f'{get_column_letter(ci)}$3)').font = body
-        nf = sum(1 for v, c in ver if v == vc and c == "not found")
-        ws.cell(row=r, column=len(got) + 2, value=nf).font = body
-        ws.cell(row=r, column=len(got) + 3, value=f"=SUM(B{r}:{get_column_letter(len(got) + 2)}{r})").font = bold
-        want = VERIFIED_TO_CLASS.get(vc)
-        if want:
-            col = get_column_letter(got.index(want) + 2)
-            c = ws.cell(row=r, column=len(got) + 4, value=f"=IFERROR({col}{r}/{get_column_letter(len(got) + 3)}{r},0)")
-            c.number_format, c.font = "0.0%", bold
-    rr = len(classes) + 5
-    ws.cell(row=rr, column=1, value="Crane footings count as isolated footings. Concrete pads carry no label, so no class "
-                                    "can be expected for them. 'Not found' = no object overlapping the verified shape "
-                                    "by 80%.").font = note
-    ws.cell(row=rr + 2, column=1, value="Band widths found in the drawing").font = bold
-    header(ws, rr + 3, ["Width (m)", "Paired line length (m)", "Share filled", "Cluster class"], [18, 16, 12, 18])
-    for i, bf in enumerate(log["band_families"], rr + 4):
-        cl = next((c["name"] or "unidentified" for c in info if c["kind"] == f"band {bf['width']:.2f} m"), "")
-        for ci, v in enumerate([bf["width"], bf["paired_m"], bf["filled_share"], cl], 1):
-            ws.cell(row=i, column=ci, value=v).font = body
-    wb.calculation.fullCalcOnLoad = True
-    wb.save(path)
-    return lrows
 
 
-_OBJ_INDEX = []
 
 
-def objs_by_index(p):
-    return _OBJ_INDEX[p[0]] if p else None
 
 
 CLASS_NAME = {"column": "Column", "shear_wall": "Shear wall", "retaining_wall": "Retaining wall", "core_wall": "Core wall",
@@ -1652,50 +1338,17 @@ def write_pdf(pdf, out_path, objs):
     doc.save(out_path, garbage=3, deflate=True)
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("pdf")
-    ap.add_argument("--config", default=str(Path(__file__).with_name("plan_config.toml")))
-    ap.add_argument("--reference", default="out/detections.json")
-    ap.add_argument("--out", default="out")
-    ap.add_argument("--dpi", type=int, default=150)
-    ap.add_argument("--version", type=int, default=None, help="output version number (default: next free one)")
-    args = ap.parse_args()
-    cfg = tomllib.loads(Path(args.config).read_text())
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    r = run(args.pdf, cfg, args.reference)
-    objs, info, labels, m1, m2, log, ver, calib = (r[n] for n in ("objs", "info", "labels", "m1", "m2", "log", "ver", "calib"))
-    _OBJ_INDEX[:] = objs
-    # a new version number per run, so earlier results stay for comparison
-    done = [int(m.group(1)) for f in out.glob("geometry_classes_v*.pdf") if (m := re.search(r"_v(\d+)\.pdf$", f.name))]
-    v = args.version or (max(done) + 1 if done else 1)
-    lrows = write_workbook(out / f"geometry_classes_v{v}.xlsx", list(objs), info, labels, m1, m2, log, ver, args.dpi, calib)
-    write_pdf(args.pdf, out / f"geometry_classes_v{v}.pdf", objs)
-    write_json(out / f"geometry_classes_v{v}.json", args.pdf, objs, calib, args.dpi)
-    pymupdf.open(out / f"geometry_classes_v{v}.pdf")[0].get_pixmap(dpi=args.dpi).save(out / f"geometry_classes_v{v}.png")
-    print(f"written out/geometry_classes_v{v}.xlsx, .pdf, .json and .png")
-    cls = collections.Counter(o["cls"] or "unidentified" for o in objs)
-    print("objects:", len(objs), dict(cls))
-    print("clusters:", len(info), "named:", sum(1 for c in info if c["name"]))
-    print("joints:", log["joints"], "regions:", log["regions"])
-    agree = collections.Counter(r["Pass 1 agrees"] for r in lrows)
-    print("pass 1 labels:", dict(agree), " pass 2 unmatched:", sum(1 for r in lrows if r["Pass 2 object"] == "unmatched"))
-    vc = collections.Counter((v, c) for v, c in ver)
-    for v in ("column", "shear_wall", "retaining_wall", "isolated_footing", "combined_footing", "crane_footing", "mass_concrete_pad"):
-        print("verified", v, "->", {c: n for (vv, c), n in vc.items() if vv == v})
-    return 0
 
 
-def run(pdf, cfg, reference=None):
+def run(pdf, cfg):
     """The whole detection and classification, without writing anything."""
-    doc, page, paths, texts = ds.load_page(pdf)
-    calib = ds.calibrate(paths, texts, ds.glyph_size(texts, cfg), cfg)
+    doc, page, paths, texts = dr.load_page(pdf)
+    calib = dr.calibrate(paths, texts, dr.glyph_size(texts, cfg), cfg)
     k = calib["pt_per_m"]
     objs, segs, tiny, log = objects(paths, texts, k)
-    features(objs, tiny, k, circles(paths, k))
+    features(objs, tiny, k)
     info = cluster(objs)
-    labels = read_labels(texts, paths, cfg, k, es.text_index(texts))
+    labels = read_labels(texts, paths, cfg, k, dr.text_index(texts))
     m1 = match(labels, objs, k)
     name_clusters(info, labels, objs, m1, label_size_meaning(cfg))
 
@@ -1805,11 +1458,11 @@ def run(pdf, cfg, reference=None):
     solids_all = [o for o in objs if o["kind"] == "solid"]
     for o in objs:
         f = o["feat"]
-        if p_columns or o["kind"] != "solid" or not f["width"] or f["length"] > es.T.ec2_ratio * f["width"] \
+        if p_columns or o["kind"] != "solid" or not f["width"] or f["length"] > dr.T.ec2_ratio * f["width"] \
                 or o["type_source"].startswith("printed") or o.get("named_by", "").startswith("label vote"):
             continue
         if any(q is not o and q["g"].distance(o["g"]) < G.touch_m * k and abs(q["feat"]["width"] - f["width"]) <= G.width_tol
-               and q["feat"]["length"] > es.T.ec2_ratio * q["feat"]["width"] for q in solids_all):
+               and q["feat"]["length"] > dr.T.ec2_ratio * q["feat"]["width"] for q in solids_all):
             o["piece"] = True
             continue
         o["cls"], o["wall_rule"] = "column", "rule: column by shape (EN 1992-1-1, L <= 4 W); the plan has no P labels to name columns"
@@ -1819,7 +1472,7 @@ def run(pdf, cfg, reference=None):
         f = o["feat"]
         # a wall drawn only by its outline, with a pattern inside (dots or strokes): wall-shaped
         # (longer than 4 x its width, EN 1992) and no thicker than the plan's walls
-        outline_wall = o["kind"] == "outline" and f["width"] and f["length"] > es.T.ec2_ratio * f["width"] \
+        outline_wall = o["kind"] == "outline" and f["width"] and f["length"] > dr.T.ec2_ratio * f["width"] \
             and f["width"] <= 2 * wall_w and f["dots_inside"] >= 1
         wall_like = o["kind"] == "cross_hatch" or o.get("piece") or outline_wall or \
             (o["kind"] == "solid" and f["width"] <= 2 * wall_w and f["length"] >= 2 * f["width"])
@@ -1847,9 +1500,43 @@ def run(pdf, cfg, reference=None):
             if fits:
                 o["key"] = "|".join(key for _, key in fits)
                 o["type_source"] = "inferred: the thickness of this retaining-wall type" + (" (several fit, nearest first)" if len(fits) > 1 else "")
-    ver = validate(objs, reference, k) if reference else None
-    return {"objs": objs, "info": info, "labels": labels, "m1": m1, "m2": m2, "log": log, "ver": ver,
+    number_objects(objs)
+    return {"objs": objs, "info": info, "labels": labels, "m1": m1, "m2": m2, "log": log,
             "calib": calib, "regions": regions, "k": k}
+
+
+CLASS_ORDER = ["column", "shear_wall", "core_wall", "retaining_wall", "isolated_footing", "combined_footing",
+               "strip_footing", "grade_beam", "raft", "sump_pit"]
+
+
+def number_objects(objs):
+    """Element ids: by building, then class, then type."""
+    order = {c: i for i, c in enumerate(CLASS_ORDER)}
+    for n, o in enumerate(sorted(objs, key=lambda o: (str(o["building"]), order.get(o["cls"], 99), str(o["cls"]), str(o["key"]))), 1):
+        o["id"] = n
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("pdf", help="the foundation plan (vector PDF)")
+    ap.add_argument("--config", default=str(Path(__file__).with_name("plan_config.toml")), help="label wording")
+    ap.add_argument("--out", default="out", help="output folder")
+    ap.add_argument("--dpi", type=int, default=150, help="resolution of annotated.png and of the JSON pixel coordinates")
+    args = ap.parse_args()
+    cfg = tomllib.loads(Path(args.config).read_text())
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    r = run(args.pdf, cfg)
+    objs, calib = r["objs"], r["calib"]
+    write_pdf(args.pdf, out / "annotated.pdf", objs)
+    pymupdf.open(out / "annotated.pdf")[0].get_pixmap(dpi=args.dpi).save(out / "annotated.png")
+    write_json(out / "detections.json", args.pdf, objs, calib, args.dpi)
+    counts = collections.Counter(o["cls"] or "unidentified" for o in objs)
+    print(f"scale 1/{calib['scale_denominator']:.0f} ({calib['inliers']} of {calib['samples']} dimensions agree)")
+    print("elements:", {c: counts[c] for c in CLASS_ORDER if counts[c]}, "| unidentified objects:", counts["unidentified"])
+    print("labels:", len(r["labels"]), "| matched:", len(r["m2"]))
+    print(f"written {out / 'annotated.pdf'}, {out / 'annotated.png'}, {out / 'detections.json'}")
+    return 0
 
 
 if __name__ == "__main__":
