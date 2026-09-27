@@ -66,6 +66,19 @@ T = SimpleNamespace(
     label_radius=1.5,
     building_k=5,
     junction_radius=0.5,
+    # drawing precision (m)
+    dash_max=2.0,               # dash pieces are at most this long
+    collinear=0.03,             # pieces this close across their direction lie on one line
+    fuse=0.01,                  # pieces this close are fused into one shape
+    hatch_search=0.5,           # a hatch stroke's parallel twins lie within this
+    hatch_gap=0.06,             # gaps up to twice this between hatch strokes are closed
+    hatch_local=0.8,            # a hatch's thickness is measured from stroke ends within this
+    band_offset=0.05,           # band pieces this close across their direction are one run
+    run_dup=0.02,               # a run inside another one grown by this is a duplicate
+    outline_min_area=0.1,       # m2; smaller closed outlines are ignored
+    outline_rectness=0.97,      # closed outlines are kept if at least this rectangular
+    stretch_thickness=(0.1, 0.6),  # a bent fill is split into straight stretches this thick ...
+    stretch_min_len=0.3,        # ... and at least this long
 )
 
 
@@ -142,11 +155,11 @@ def mark_dashed(segs, k):
     lines are axes or hidden lines, never the visible edge of an element."""
     groups = collections.defaultdict(list)
     for i, s_ in enumerate(segs):
-        if s_["len"] > 2.0:
+        if s_["len"] > T.dash_max:
             continue
         a = round(math.degrees(s_["ang"]) * 5) / 5 % 180
         mid = ((s_["a"][0] + s_["b"][0]) / 2, (s_["a"][1] + s_["b"][1]) / 2)
-        groups[(a, round(offset(mid, s_["ang"]) / (0.03 * k)))].append(i)
+        groups[(a, round(offset(mid, s_["ang"]) / (T.collinear * k)))].append(i)
     n = 0
     for ids in groups.values():
         if len(ids) < T.grid_min_pieces:
@@ -192,7 +205,7 @@ def filled_objects(paths, k):
     for o in objs:
         g = o["g"]
         if g.geom_type != "Polygon":
-            g = g.buffer(0.01 * k).buffer(-0.01 * k)
+            g = g.buffer(T.fuse * k).buffer(-T.fuse * k)
         if g.geom_type != "Polygon" or g.is_empty:
             if not g.is_empty:
                 others.append(g)
@@ -211,10 +224,12 @@ def filled_objects(paths, k):
     return kept, dups, others
 
 
-def straight_stretches(g, k, t_range=(0.1, 0.6), min_len=0.3):
+def straight_stretches(g, k, t_range=None, min_len=None):
     """Split a thin filled polygon with bends (a wall drawn as one object around corners) into
     straight stretches: pairs of opposite, parallel edges one wall-thickness apart."""
-    ring = list(g.simplify(0.01 * k).exterior.coords)
+    t_range = t_range or T.stretch_thickness
+    min_len = T.stretch_min_len if min_len is None else min_len
+    ring = list(g.simplify(T.fuse * k).exterior.coords)
     edges = []
     for a, b in zip(ring, ring[1:]):
         L = math.dist(a, b)
@@ -236,7 +251,7 @@ def straight_stretches(g, k, t_range=(0.1, 0.6), min_len=0.3):
             o1, o2 = offset(a, ang), offset(((c[0] + d[0]) / 2, (c[1] + d[1]) / 2), ang)
             P = lambda u, v: (u * ux - v * uy, u * uy + v * ux)
             piece = Polygon([P(lo, o1), P(hi, o1), P(hi, o2), P(lo, o2)])
-            if piece.is_valid and g.buffer(0.01 * k).contains(piece):   # both faces of the same stretch
+            if piece.is_valid and g.buffer(T.fuse * k).contains(piece):   # both faces of the same stretch
                 out.append(piece)
     kept = []
     for p_ in sorted(out, key=lambda p_: -p_.area):
@@ -260,7 +275,7 @@ def hatched_regions(segs, k):
     hatch = []
     for s in cand:
         twins = 0
-        for j in tree.query(s["g"].buffer(0.5 * k)):
+        for j in tree.query(s["g"].buffer(T.hatch_search * k)):
             t = cand[j]
             if t is s:
                 continue
@@ -271,7 +286,7 @@ def hatched_regions(segs, k):
     if not hatch:
         return []
     # close the gaps between strokes to recover the hatched area
-    blobs = unary_union([s["g"].buffer(0.06 * k) for s in hatch])
+    blobs = unary_union([s["g"].buffer(T.hatch_gap * k) for s in hatch])
     blobs = [b for b in getattr(blobs, "geoms", [blobs])]
     htree = STRtree([s["g"] for s in hatch])
     out = []
@@ -290,7 +305,7 @@ def hatched_regions(segs, k):
         samples = []
         for s in members[::max(1, len(members) // 60)]:
             c = s["g"].centroid
-            local = [ends[i] for i in etree.query(c.buffer(0.8 * k))]
+            local = [ends[i] for i in etree.query(c.buffer(T.hatch_local * k))]
             if len(local) >= 6:
                 mrr = MultiPoint(local).minimum_rotated_rectangle
                 if mrr.geom_type == "Polygon":
@@ -299,7 +314,7 @@ def hatched_regions(segs, k):
                     if max(a, bb) > 2.5 * min(a, bb):  # a straight stretch, not a corner
                         samples.append(min(a, bb) / k)
         thickness = statistics.median(samples) if samples else None
-        region = b.buffer(-0.06 * k).buffer(0)
+        region = b.buffer(-T.hatch_gap * k).buffer(0)
         region = max(getattr(region, "geoms", [region]), key=lambda g: g.area) if not region.is_empty else b.buffer(0)
         area = region.area / k ** 2
         out.append({"g": region, "strokes": len(members), "cross": cross,
@@ -360,7 +375,7 @@ def band_runs(pieces, k):
     groups = collections.defaultdict(list)
     for p in pieces:
         a = round(math.degrees(p["ang"]) * 2) / 2 % 180
-        groups[(a, round(p["off"] / (0.05 * k)), p["width"])].append(p)
+        groups[(a, round(p["off"] / (T.band_offset * k)), p["width"])].append(p)
     runs = []
     for (a, _, w), ps in groups.items():
         ps.sort(key=lambda p: p["lo"])
@@ -385,7 +400,7 @@ def band_runs(pieces, k):
     runs.sort(key=lambda r: -r["length"])
     kept = []
     for r in runs:
-        if any(q["poly"].buffer(0.02 * k).contains(r["poly"]) for q in kept):
+        if any(q["poly"].buffer(T.run_dup * k).contains(r["poly"]) for q in kept):
             continue
         kept.append(r)
     return kept
@@ -507,10 +522,10 @@ def closed_outlines(paths, k, tboxes):
         if p["type"] != "s":
             continue
         for g in ds.subpolygons(p):
-            if g.area / k ** 2 < 0.1 or in_text(g, tboxes):
+            if g.area / k ** 2 < T.outline_min_area or in_text(g, tboxes):
                 continue
             o = ds.oriented(g, k)
-            if o["rectness"] > 0.97:
+            if o["rectness"] > T.outline_rectness:
                 out.append({"g": g, "o": o, "idx": i, "width_pt": p["width"]})
     kept = []
     for r in sorted(out, key=lambda r: -r["g"].area):

@@ -89,6 +89,37 @@ G = SimpleNamespace(
     footprint_close=3.0,        # ... and gaps up to twice this (m) closed
     edge_margin=0.6,            # a wall within footprint_grow + this (m) of the grown footprint's edge, parallel to it, is on the edge
     pen_share=0.1,              # a pen used by at least this share of the labelled columns is a column pen
+    # drawing precision (m): how close counts as touching, lying on, inside or next to
+    on_border=0.015,            # a line this close to a shape's border runs along that border
+    inside_margin=0.005,        # a line lies between two others only if at least this far inside them
+    stroke_reach=0.01,          # a hatch stroke may reach this far past the band it hatches
+    fuse=0.01,                  # pieces this close are fused into one shape
+    grow=0.03,                  # shapes are grown by this before testing whether they cover something
+    near=0.05,                  # a band, hatch or label this close to an object is next to it
+    on_region=0.1,              # an object whose centre is this close to a stamped region is on it
+    dot_max=0.1,                # marks smaller than this are dots of a pattern
+    # the smallest things considered (m, m2)
+    line_min=0.5,               # band edges: lines at least this long ...
+    overlap_min=0.5,            # ... running side by side over at least this length
+    band_min=0.1,               # the narrowest band
+    stroke_max=1.0,             # hatch strokes inside a band are shorter than this
+    hatch_min_len=0.3,          # hatched areas shorter than this are ignored
+    fill_min_area=0.02,         # m2; smaller loose fills are ignored
+    bent_fill_min_area=0.5,     # m2; smaller bent fills are not split into straight stretches
+    region_min_area=20.0,       # m2; smaller building regions are slivers left by the joint cuts
+    wall_default=0.25,          # wall thickness assumed only if no labelled wall exists to learn it from
+    # raft stamps: rays from the raft's corners to the stamp, and the outline they point to
+    ray_min=1.5,                # a ray is a line at least this long ...
+    ray_search=0.5,             # ... found within this of the stamp circle ...
+    ray_start=0.4,              # ... that starts within this of the circle ...
+    ray_reach=2.0,              # ... and reaches at least this far from the stamp's centre
+    trace_zone=2.0,             # the outline is traced within this of the rays' ends
+    trace_snap=0.05,            # line ends closer than this meet
+    trace_min_line=0.1,         # shorter lines are ignored while tracing
+    trace_wall_reach=0.1,       # a wall this close to an open end of the outline closes it
+    # expansion joints
+    joint_reach=0.5,            # the cut follows the joint line within this ...
+    joint_cut=0.1,              # ... and is this wide
 )
 
 LABEL_CLASS = {"column": "column", "wall": "shear_wall", "retaining_wall": "retaining_wall",
@@ -125,17 +156,17 @@ def band_pairs(segs, k, fill_tree, fill_geoms):
     (lines of other elements may cross a band). A side of a closed shape pairs only with another side
     of that same shape (an element drawn as a closed long rectangle): paired with anything else it
     bounds its own shape (a footing, a pit's double box), not a band."""
-    lines = [s for s in segs if s["len"] >= 0.5 and s["stroke"] and not s.get("dashed") and not s.get("axis_pen")]
+    lines = [s for s in segs if s["len"] >= G.line_min and s["stroke"] and not s.get("dashed") and not s.get("axis_pen")]
     tree = STRtree([s["g"] for s in lines])
     # short strokes, to spot hatching inside a band
-    short = [s for s in segs if s["len"] < 1.0 and s["stroke"] and not s.get("dashed") and not s.get("axis_pen")]
+    short = [s for s in segs if s["len"] < G.stroke_max and s["stroke"] and not s.get("dashed") and not s.get("axis_pen")]
     short_tree = STRtree([s["g"] for s in short])
     # a line that mostly runs along a solid's border is that solid's edge, not a band edge
     for s in lines:
-        near = [fill_geoms[i] for i in fill_tree.query(s["g"].buffer(0.02 * k))]
+        near = [fill_geoms[i] for i in fill_tree.query(s["g"].buffer(G.touch_m * k))]
         border = unary_union([g.exterior for g in near if g.geom_type == "Polygon"]) if near else None
         s["on_solid_edge"] = bool(border is not None and not border.is_empty and
-                                  s["g"].intersection(border.buffer(0.015 * k)).length > 0.5 * s["g"].length)
+                                  s["g"].intersection(border.buffer(G.on_border * k)).length > 0.5 * s["g"].length)
     out = []
     for i, s in enumerate(lines):
         ang = s["ang"]
@@ -151,7 +182,7 @@ def band_pairs(segs, k, fill_tree, fill_geoms):
             to = es.offset(t_mid, ang)
             t_lo, t_hi = sorted((es.along(t["a"], ang), es.along(t["b"], ang)))
             lo, hi = max(s_lo, t_lo), min(s_hi, t_hi)
-            if (hi - lo) / k < 0.5:
+            if (hi - lo) / k < G.overlap_min:
                 continue
             between.append((to, lo, hi, j))
         for to, lo, hi, j in between:
@@ -160,9 +191,9 @@ def band_pairs(segs, k, fill_tree, fill_geoms):
             if (s.get("closed") or lines[j].get("closed")) and s["idx"] != lines[j]["idx"]:
                 continue
             sp = abs(to - so) / k
-            if sp < 0.1 or sp > G.band_max:
+            if sp < G.band_min or sp > G.band_max:
                 continue
-            inside = [j2 for o2, l2, h2, j2 in between if j2 != j and min(so, to) + 0.005 * k < o2 < max(so, to) - 0.005 * k
+            inside = [j2 for o2, l2, h2, j2 in between if j2 != j and min(so, to) + G.inside_margin * k < o2 < max(so, to) - G.inside_margin * k
                       and lines[j2]["w"] == s["w"] and min(h2, hi) - max(l2, lo) > 0.3 * (hi - lo)]
             inner = bool(inside)
             # a line between the edges that is not the border of a filled element belongs to another
@@ -177,7 +208,7 @@ def band_pairs(segs, k, fill_tree, fill_geoms):
             # hatched element (a hatched wall between its two border lines)
             # hatching = one family of short parallel strokes lying within the band (lines that merely
             # cross it, such as axis dashes or dimension ticks, run on beyond its edges)
-            inner_poly = poly.buffer(0.01 * k)
+            inner_poly = poly.buffer(G.stroke_reach * k)
             strokes = [short[q] for q in short_tree.query(poly)
                        if inner_poly.contains(short[q]["g"]) and abs(math.sin(short[q]["ang"] - ang)) > 0.3]
             fam = collections.Counter(round(math.degrees(t["ang"]) / 5) for t in strokes)
@@ -258,9 +289,9 @@ def trace_outline(corners, stamp, segs, k, rays, solids=()):
     from shapely import set_precision
     from shapely.ops import polygonize
     hull = MultiPoint(corners).convex_hull
-    zone = hull.buffer(2.0 * k)
-    snap = 0.05 * k
-    cand = [s for s in segs if s["stroke"] and not s.get("dashed") and not s.get("axis_pen") and s["len"] >= 0.1
+    zone = hull.buffer(G.trace_zone * k)
+    snap = G.trace_snap * k
+    cand = [s for s in segs if s["stroke"] and not s.get("dashed") and not s.get("axis_pen") and s["len"] >= G.trace_min_line
             and s["g"].intersects(zone) and not any(s is r for r in rays)]
     key = lambda pt: (round(pt[0] / snap), round(pt[1] / snap))
     nodes = collections.defaultdict(list)
@@ -318,15 +349,15 @@ def trace_outline(corners, stamp, segs, k, rays, solids=()):
         ends run into become part of the boundary; the region is the enclosed area around the stamp."""
         lines = [cand[i]["g"] for i in ids]
         ends = [Point(pt) for i in ids for pt in (cand[i]["a"], cand[i]["b"])]
-        walls = [g for g in solids if g.intersects(zone) and any(g.distance(e) < 0.1 * k for e in ends)]
+        walls = [g for g in solids if g.intersects(zone) and any(g.distance(e) < G.trace_wall_reach * k for e in ends)]
         if not walls:
             return None
-        barrier = unary_union([l.buffer(0.03 * k) for l in lines] + [w.buffer(0.02 * k) for w in walls])
+        barrier = unary_union([l.buffer(G.grow * k) for l in lines] + [w.buffer(G.touch_m * k) for w in walls])
         free = zone.difference(barrier)
         room = next((g for g in getattr(free, "geoms", [free]) if g.contains(stamp)), None)
         if room is None or room.boundary.intersects(zone.boundary):
             return None                         # not closed: leaks out of the search zone
-        g = Polygon(room.exterior.coords).buffer(0.03 * k)
+        g = Polygon(room.exterior.coords).buffer(G.grow * k)
         return g if 0.6 * hull.area <= g.area <= 1.6 * hull.area else None
 
     start = {i for c in corners for dx in (-1, 0, 1) for dy in (-1, 0, 1)
@@ -352,19 +383,19 @@ def stamp_rafts(paths, segs, k, solids=()):
     """Circle stamps with at least three straight rays from far away ending on the circle: the
     rays come from the corners of the element the stamp names (rafts here). Its extent is the
     outline those rays end on (not always a rectangle); the rays' convex hull if that fails."""
-    long_ = [s for s in segs if s["len"] >= 1.5 and not s.get("dashed")]
+    long_ = [s for s in segs if s["len"] >= G.ray_min and not s.get("dashed")]
     tree = STRtree([s["g"] for s in long_])
     out, seen = [], []
     for c, r in circles(paths, k):
         if any(c.distance(q) < r for q in seen):
             continue
         corners, dirs, rays = [], set(), []
-        for i in tree.query(c.buffer(r + 0.5 * k)):
+        for i in tree.query(c.buffer(r + G.ray_search * k)):
             s = long_[i]
             ux, uy = es.axis(s["ang"])
             perp = abs(-(c.x - s["a"][0]) * uy + (c.y - s["a"][1]) * ux)
             da, db = math.dist(s["a"], (c.x, c.y)), math.dist(s["b"], (c.x, c.y))
-            if perp < 0.3 * r and min(da, db) < r + 0.4 * k and max(da, db) > 2.0 * k:
+            if perp < 0.3 * r and min(da, db) < r + G.ray_start * k and max(da, db) > G.ray_reach * k:
                 far = s["b"] if db > da else s["a"]
                 corners.append(far)
                 rays.append(s)
@@ -391,7 +422,7 @@ def objects(paths, texts, k):
     thin = 2 * statistics.median(r["o"]["width_m"] for r in rects) if rects else 0.4
     for g in others:
         area = g.area / k ** 2
-        if area >= 0.5 and g.geom_type == "Polygon" and 2 * area / (g.length / k) <= thin:
+        if area >= G.bent_fill_min_area and g.geom_type == "Polygon" and 2 * area / (g.length / k) <= thin:
             for piece in es.straight_stretches(g, k):
                 over = [s for s in solids if piece.intersection(s).area > 0]
                 if not any(piece.intersection(s).area > 0.5 * piece.area for s in over):
@@ -416,7 +447,7 @@ def objects(paths, texts, k):
     stree = STRtree([ls for ls, _ in strokes])
     for o in out:
         border = o["g"].exterior
-        band = border.buffer(0.015 * k)
+        band = border.buffer(G.on_border * k)
         along = collections.Counter()
         for i in stree.query(band):
             ls, w = strokes[i]
@@ -429,17 +460,17 @@ def objects(paths, texts, k):
     for o in out:
         o["outline_pen_rel"] = o["outline_pen"] / top_pen
     for h in es.hatched_regions(segs, k):
-        if h["length"] and h["length"] >= 0.3:
+        if h["length"] and h["length"] >= G.hatch_min_len:
             out.append(obj("cross_hatch" if h["cross"] else "single_hatch", h["g"], k, hatch=h))
     rafts = stamp_rafts(paths, segs, k, solids)
     out += rafts
     # what fills a band: solid fills and hatched areas
-    fill_geoms = [o["g"] for o in out if o["kind"] in ("solid", "cross_hatch")] + [g for g in others if g.area > 0.02 * k * k]
+    fill_geoms = [o["g"] for o in out if o["kind"] in ("solid", "cross_hatch")] + [g for g in others if g.area > G.fill_min_area * k * k]
     fill_tree = STRtree(fill_geoms)
     solid_tree = STRtree([o["g"] for o in out if o["kind"] == "solid"])
     solid_list = [o for o in out if o["kind"] == "solid"]
     walls_u = unary_union([o["g"] for o in out if o["kind"] in ("solid", "cross_hatch")] +
-                          [g for g in others if g.area > 0.02 * k * k]).buffer(0.03 * k)
+                          [g for g in others if g.area > G.fill_min_area * k * k]).buffer(G.grow * k)
     for c in es.closed_outlines(paths, k, tb):
         g = c["g"]
         area = g.area / k ** 2
@@ -485,7 +516,7 @@ def objects(paths, texts, k):
             if skew <= G.parallel_deg and same_w and \
                     h["g"].intersection(s["g"]).area > 0.5 * min(h["g"].area, s["g"].area):
                 u = h["o"]["obb"] and unary_union([s["g"], Polygon(h["o"]["obb"])])
-                u = u if u.geom_type == "Polygon" else u.buffer(0.01 * k).buffer(-0.01 * k)
+                u = u if u.geom_type == "Polygon" else u.buffer(G.fuse * k).buffer(-G.fuse * k)
                 if u.geom_type == "Polygon":
                     s.update(g=u, geom=u, o=ds.oriented(u, k), drawn_twice=True)
                     out.remove(h)
@@ -501,14 +532,14 @@ def objects(paths, texts, k):
         if o["kind"] != "outline":
             continue
         near = [walls_now[i] for i in wtree.query(o["g"])]
-        if near and unary_union([w["g"] for w in near]).buffer(0.03 * k).intersection(o["g"]).area > 0.8 * o["g"].area:
+        if near and unary_union([w["g"] for w in near]).buffer(G.grow * k).intersection(o["g"]).area > 0.8 * o["g"].area:
             borders.append(o)
             continue
         # a hatched wall lying inside the outline, parallel to it (its hatch may stop short of the
         # border, e.g. where a column fills one end): the wall takes the outline's exact shape
         if not o["o"]:
             continue
-        grown = o["g"].buffer(0.03 * k)
+        grown = o["g"].buffer(G.grow * k)
         inside = [w for w in near if w["kind"] in ("cross_hatch", "single_hatch") and w["o"]
                   and w["g"].intersection(grown).area >= 0.8 * w["g"].area
                   and abs((w["o"]["angle_deg"] - o["o"]["angle_deg"] + 90) % 180 - 90) <= G.parallel_deg]
@@ -534,7 +565,7 @@ def objects(paths, texts, k):
     body = unary_union([o["g"] for o in out if o["kind"] == "solid"]).buffer(G.area_buffer * k)
     inside = [o for o in out if body.contains(o["g"].centroid)]
     log["outside_drawing"] = dict(collections.Counter(o["kind"] for o in out if o not in inside))
-    tiny = [ds.centre(p["rect"]) for p in paths if max(p["rect"][2] - p["rect"][0], p["rect"][3] - p["rect"][1]) < 0.1 * k]
+    tiny = [ds.centre(p["rect"]) for p in paths if max(p["rect"][2] - p["rect"][0], p["rect"][3] - p["rect"][1]) < G.dot_max * k]
     return inside, segs, tiny, log
 
 
@@ -586,17 +617,17 @@ def features(objs, tiny, k, circ=()):
             L, W = o["hatch"]["length"], o["hatch"]["thickness"]
         f.update(length=L, width=W, aspect=L / W if W else 0.0, area=g.area / k ** 2)
         f["solids_inside"] = sum(1 for i in s_tree.query(g) if solids[i] is not o
-                                 and g.buffer(0.02 * k).intersection(solids[i]["g"]).area > 0.5 * solids[i]["g"].area)
+                                 and g.buffer(G.touch_m * k).intersection(solids[i]["g"]).area > 0.5 * solids[i]["g"].area)
         f["dots_inside"] = sum(1 for i in tiny_tree.query(g) if g.contains(tiny[i]))
-        f["touches_solid"] = sum(1 for i in s_tree.query(g.buffer(0.02 * k)) if solids[i] is not o
-                                 and solids[i]["g"].distance(g) < 0.02 * k)
-        f["inside_outline"] = int(any(outlines[i] is not o and outlines[i]["g"].buffer(0.02 * k).intersection(g).area > 0.5 * g.area
+        f["touches_solid"] = sum(1 for i in s_tree.query(g.buffer(G.touch_m * k)) if solids[i] is not o
+                                 and solids[i]["g"].distance(g) < G.touch_m * k)
+        f["inside_outline"] = int(any(outlines[i] is not o and outlines[i]["g"].buffer(G.touch_m * k).intersection(g).area > 0.5 * g.area
                                       for i in o_tree.query(g)))
         f["in_band_holding_solid"] = int(hold_u is not None and o["kind"] != "band"
                                          and hold_u.intersection(g).area > 0.5 * g.area)
-        f["empty_bands_touching"] = sum(1 for i in e_tree.query(g.buffer(0.05 * k)) if empty[i] is not o)
-        f["on_stamped_region"] = int(any(r["g"].buffer(0.1 * k).contains(g.centroid) for r in stamped if r is not o))
-        f["touches_cross_hatch"] = int(any(h["g"].distance(g) < 0.05 * k for h in hatch if h is not o))
+        f["empty_bands_touching"] = sum(1 for i in e_tree.query(g.buffer(G.near * k)) if empty[i] is not o)
+        f["on_stamped_region"] = int(any(r["g"].buffer(G.on_region * k).contains(g.centroid) for r in stamped if r is not o))
+        f["touches_cross_hatch"] = int(any(h["g"].distance(g) < G.near * k for h in hatch if h is not o))
         f["outline_pen"] = o.get("outline_pen_rel", 0.0)
         f["stamp_inside"] = int(o["kind"] == "outline" and any(g.contains(c) and c.buffer(r).within(g) for c, r in circ))
     perimeter_flags(objs, k)
@@ -742,7 +773,7 @@ def label_distance(l, o, k):
     """Metres from a label to an object: to the solid itself; to the edge of a closed outline (a
     label deep inside a footing is about what stands in it); to the stamp of a stamped region."""
     if o["kind"] == "outline":
-        return 0.0 if o["g"].exterior.distance(l["c"]) < 0.05 * k else o["g"].exterior.distance(l["c"]) / k
+        return 0.0 if o["g"].exterior.distance(l["c"]) < G.near * k else o["g"].exterior.distance(l["c"]) / k
     if o["kind"] == "stamped_region":
         return o["stamp"].distance(l["c"]) / k
     return 0.0 if o["g"].contains(l["c"]) else o["g"].distance(l["c"]) / k
@@ -949,11 +980,11 @@ def building_regions(objs, labels, segs, k):
         # extend until it leaves the footprint on both sides, keeping only the stretch through the
         # joint's own part of the building (a U-shaped plan must not be cut across its other arm)
         ext = LineString([(ax - ux * span, ay - uy * span), (bx + ux * span, by + uy * span)]).intersection(body)
-        piece = next((g for g in getattr(ext, "geoms", [ext]) if g.distance(ls) < 0.5 * k and g.length > 0), None)
+        piece = next((g for g in getattr(ext, "geoms", [ext]) if g.distance(ls) < G.joint_reach * k and g.length > 0), None)
         if piece is not None:
-            cuts.append(piece.buffer(0.1 * k))
+            cuts.append(piece.buffer(G.joint_cut * k))
     regions = body.difference(unary_union(cuts)) if cuts else body
-    regions = [g for g in getattr(regions, "geoms", [regions]) if g.area > 20 * k * k]
+    regions = [g for g in getattr(regions, "geoms", [regions]) if g.area > G.region_min_area * k * k]
     info = []
     for g in regions:
         v = collections.Counter(l["building"] for l in labels if l.get("building") and g.contains(l["c"]))
@@ -1678,7 +1709,7 @@ def run(pdf, cfg, reference=None):
     # - an unlabelled wall-like solid or hatched wall along the building edge is a retaining wall,
     #   one inside the building that is no V type is a core wall.
     wall_w = statistics.median(o["feat"]["width"] for o in objs if o["cls"] in ("shear_wall", "retaining_wall")) \
-        if any(o["cls"] in ("shear_wall", "retaining_wall") for o in objs) else 0.25
+        if any(o["cls"] in ("shear_wall", "retaining_wall") for o in objs) else G.wall_default
     # a plan without P labels cannot name its columns by vote: there, an unlabelled solid of column
     # shape (EN 1992-1-1 5.3.1(7): section no longer than 4 x its width) is a column, unless it
     # continues a wall of the same thickness (a piece of that wall)
