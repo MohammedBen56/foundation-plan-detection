@@ -57,6 +57,7 @@ G = SimpleNamespace(
     band_tol=0.015,
     band_empty=0.3,            # empty band: at most this share filled
     band_holds=(0.1, 0.9),     # band holding a solid: this share filled (the top only excludes a band that is the wall itself)
+    hatch_spread=0.5,          # a hatched band has its strokes along most of its length (a column may fill one end)
     band_holding=0.15,         # a band family holding solids on average at least this share is a strip, not a beam
     outline_max_area=60.0,     # m2; larger closed outlines are frames, not elements
     stamp_diameter=(0.8, 3.0),
@@ -161,9 +162,12 @@ def band_pairs(segs, k, fill_tree, fill_geoms):
             sp = abs(to - so) / k
             if sp < 0.1 or sp > G.band_max:
                 continue
-            inner = any(min(so, to) + 0.005 * k < o2 < max(so, to) - 0.005 * k and lines[j2]["w"] == s["w"]
-                        and min(h2, hi) - max(l2, lo) > 0.3 * (hi - lo)
-                        for o2, l2, h2, j2 in between if j2 != j)
+            inside = [j2 for o2, l2, h2, j2 in between if j2 != j and min(so, to) + 0.005 * k < o2 < max(so, to) - 0.005 * k
+                      and lines[j2]["w"] == s["w"] and min(h2, hi) - max(l2, lo) > 0.3 * (hi - lo)]
+            inner = bool(inside)
+            # a line between the edges that is not the border of a filled element belongs to another
+            # element (a beam's edge): such a pair is two elements side by side, not one band holding a wall
+            foreign = any(not lines[j2]["on_solid_edge"] for j2 in inside)
             mid = (so + to) / 2
             half = sp * k / 2
             P = lambda u, v: (u * ux - v * uy, u * uy + v * ux)
@@ -174,13 +178,22 @@ def band_pairs(segs, k, fill_tree, fill_geoms):
             # hatching = one family of short parallel strokes lying within the band (lines that merely
             # cross it, such as axis dashes or dimension ticks, run on beyond its edges)
             inner_poly = poly.buffer(0.01 * k)
-            fam = collections.Counter(round(math.degrees(short[q]["ang"]) / 5) for q in short_tree.query(poly)
-                                      if inner_poly.contains(short[q]["g"]) and abs(math.sin(short[q]["ang"] - ang)) > 0.3)
-            hatched = bool(fam) and fam.most_common(1)[0][1] >= 3 * (hi - lo) / k
+            strokes = [short[q] for q in short_tree.query(poly)
+                       if inner_poly.contains(short[q]["g"]) and abs(math.sin(short[q]["ang"] - ang)) > 0.3]
+            fam = collections.Counter(round(math.degrees(t["ang"]) / 5) for t in strokes)
+            hatched = False
+            if fam:
+                top_dir, n_top = fam.most_common(1)[0]
+                # ... spread along the band's length: a dense pattern in one spot (a pad sitting on a
+                # beam) does not make the whole band a hatched wall
+                pos = [es.along(((t["a"][0] + t["b"][0]) / 2, (t["a"][1] + t["b"][1]) / 2), ang)
+                       for t in strokes if round(math.degrees(t["ang"]) / 5) == top_dir]
+                hatched = n_top >= 3 * (hi - lo) / k and max(pos) - min(pos) >= G.hatch_spread * (hi - lo)
             if hatched:
                 filled = max(filled, 1.0)
             out.append({"sp": sp, "lo": lo, "hi": hi, "ang": ang, "off": mid, "poly": poly, "filled": filled,
-                        "adjacent": not inner, "edges_on_solid": s["on_solid_edge"] or lines[j]["on_solid_edge"],
+                        "adjacent": not inner, "foreign_inside": foreign,
+                        "edges_on_solid": s["on_solid_edge"] or lines[j]["on_solid_edge"],
                         "lines": (s["idx"], lines[j]["idx"]), "overlap": (hi - lo) / k, "pen": s["w"],
                         "hatched": hatched})
     return out
@@ -191,7 +204,7 @@ def band_families(pairs):
     two lines face each other with nothing drawn between them, or hold a solid between them; pairs
     with an edge on a solid's face (the gap beside a wall, or the wall's own border) do not."""
     ps = [p for p in pairs if not p["edges_on_solid"] and p["filled"] <= G.band_holds[1]
-          and (p["adjacent"] or p["filled"] >= G.band_holds[0])]
+          and (p["adjacent"] or (p["filled"] >= G.band_holds[0] and not p["foreign_inside"]))]
     fams = []
     if not ps:
         return fams
@@ -479,6 +492,32 @@ def objects(paths, texts, k):
                     merged += 1
                     break
     log["hatched_and_filled"] = merged
+    # an outline drawn around a wall that was found by its fill or hatch is that wall's border, not an
+    # object of its own (checked again here, now that bent hatched regions are split into legs)
+    walls_now = [o for o in out if o["kind"] in ("solid", "cross_hatch", "single_hatch")]
+    wtree = STRtree([o["g"] for o in walls_now])
+    borders = []
+    for o in out:
+        if o["kind"] != "outline":
+            continue
+        near = [walls_now[i] for i in wtree.query(o["g"])]
+        if near and unary_union([w["g"] for w in near]).buffer(0.03 * k).intersection(o["g"]).area > 0.8 * o["g"].area:
+            borders.append(o)
+            continue
+        # a hatched wall lying inside the outline, parallel to it (its hatch may stop short of the
+        # border, e.g. where a column fills one end): the wall takes the outline's exact shape
+        if not o["o"]:
+            continue
+        grown = o["g"].buffer(0.03 * k)
+        inside = [w for w in near if w["kind"] in ("cross_hatch", "single_hatch") and w["o"]
+                  and w["g"].intersection(grown).area >= 0.8 * w["g"].area
+                  and abs((w["o"]["angle_deg"] - o["o"]["angle_deg"] + 90) % 180 - 90) <= G.parallel_deg]
+        if inside:
+            w = max(inside, key=lambda w: w["g"].area)
+            w.update(g=o["g"], geom=o["g"], o=o["o"], border_shape=True)
+            borders.append(o)
+    out = [o for o in out if not any(o is b for b in borders)]
+    log["wall_borders_dropped"] = len(borders)
     fams = band_families(pairs)
     log["band_families"] = [{"width": f["width"], "paired_m": f["paired_m"], "filled_share": f["filled_share"]} for f in fams]
     outl = [o["g"] for o in out if o["kind"] == "outline"]
@@ -513,7 +552,7 @@ def perimeter_flags(objs, k):
     etree = STRtree(edges)
     for o in objs:
         o["feat"]["on_perimeter"] = 0
-        if o["kind"] not in ("solid", "cross_hatch") or not o["o"]:
+        if o["kind"] not in ("solid", "cross_hatch", "outline") or not o["o"]:
             continue
         c = o["g"].centroid
         reach = (G.footprint_grow + G.edge_margin) * k        # the grown edge lies footprint_grow outside the walls
@@ -1075,7 +1114,8 @@ def validate(objs, ref_path, k):
 # ---------------------------------------------------------------------------
 # 5. Outputs
 # ---------------------------------------------------------------------------
-OBJ_COLS = [("ID", 6), ("Building", 9), ("Building from", 22), ("Drawing kind", 14), ("Cluster", 8), ("Class", 17), ("Class named by", 26),
+OBJ_COLS = [("ID", 6), ("Building", 9), ("Building from", 22), ("Drawing kind", 14), ("Cluster", 8), ("Class", 17),
+            ("Label shown", 34), ("Class named by", 26),
             ("Type key", 14), ("Type source", 30), ("Label text", 20), ("Length (cm)", 9), ("Width (cm)", 9), ("L/W", 7),
             ("Area (m²)", 9), ("Angle (°)", 8), ("Touches solids", 8), ("Inside an outline", 8), ("In a strip band", 8),
             ("On a stamped region", 8), ("On the building edge", 8), ("Solids inside", 8), ("Dots inside", 8), ("Beams touching", 8), ("Net length (m)", 9), ("Extent", 14),
@@ -1198,7 +1238,7 @@ def write_workbook(path, objs, info, labels, m1, m2, log, ver, dpi, calib):
         c = cinfo[o["cluster"]]
         vals = {"ID": o["id"], "Building": o["building"] or "unknown", "Building from": o.get("building_source", ""),
                 "Drawing kind": o["kind"], "Cluster": o["cluster"],
-                "Class": o["cls"] or "unnamed",
+                "Class": o["cls"] or "unnamed", "Label shown": display_label(o),
                 "Class named by": o.get("wall_rule") or o.get("named_by") or "no label votes",
                 "Type key": o["key"] or "(none)", "Type source": o["type_source"], "Label text": o["label_text"] or "",
                 "Length (cm)": round(f["length"] * 100), "Width (cm)": round(f["width"] * 100),
@@ -1377,6 +1417,26 @@ def objs_by_index(p):
     return _OBJ_INDEX[p[0]] if p else None
 
 
+CLASS_NAME = {"column": "Column", "shear_wall": "Shear wall", "retaining_wall": "Retaining wall", "core_wall": "Core wall",
+              "isolated_footing": "Isolated footing", "combined_footing": "Combined footing", "strip_footing": "Strip footing",
+              "grade_beam": "Grade beam", "raft": "Raft", "sump_pit": "Sump pit"}
+
+
+def display_label(o):
+    """The text shown with an element: its class in words, its type (~ = inferred) and its measured
+    size in metres (length x width of its box; a shape that is not a rectangle also gets its area)."""
+    if not o["cls"]:
+        return f"C{o['cluster']}"
+    key = o["key"] or ""
+    if key and o["type_source"].startswith("inferred"):
+        key = "~" + key
+    f = o["feat"]
+    size = f"{f['length']:.2f} × {f['width']:.2f} m"
+    if not box_fits(o):
+        size += f", {f['area']:.1f} m²"
+    return " ".join(x for x in (CLASS_NAME.get(o["cls"], o["cls"]), key, size) if x)
+
+
 # the brief's element categories; the class is kept as the subclass
 ELEMENT_TYPE = {"column": "column", "shear_wall": "wall", "retaining_wall": "wall", "core_wall": "wall",
                 "isolated_footing": "footing", "combined_footing": "footing", "strip_footing": "footing",
@@ -1394,6 +1454,7 @@ def write_json(path, pdf, objs, calib, dpi):
         f = o["feat"]
         x0, y0, x1, y1 = o["g"].bounds
         d = {"id": o["id"], "element_type": ELEMENT_TYPE.get(o["cls"], "other"), "class": o["cls"],
+             "display_label": display_label(o),
              "type_key": ("~" if o["type_source"].startswith("inferred") else "") + (o["key"] or "?"),
              "type_source": o["type_source"], "label": o["label_text"] or None,
              "class_named_by": o.get("wall_rule") or o.get("named_by") or "",
@@ -1431,6 +1492,23 @@ def box_fits(o):
     return o["g"].exterior.hausdorff_distance(LineString(list(obb) + [obb[0]])) <= thickness
 
 
+def label_anchor(o, gap=0.6):
+    """Where a label is written: along a long element, just outside the long side higher on the
+    page, read left to right; above the box's corner for a compact element."""
+    oo, f = o["o"], o["feat"]
+    if oo and f["width"] and f["length"] >= 3 * f["width"] and box_fits(o):
+        c = oo["obb"]
+        sides = [(c[i], c[(i + 1) % 4]) for i in range(4)]
+        longs = sorted(sides, key=lambda sd: -math.dist(*sd))[:2]
+        top = min(longs, key=lambda sd: sd[0][1] + sd[1][1])
+        a, b = sorted(top, key=lambda q: (q[0], -q[1]))
+        ang = math.degrees(math.atan2(b[1] - a[1], b[0] - a[0]))
+        nx, ny = math.sin(math.radians(ang)), -math.cos(math.radians(ang))     # the side's outward normal, up the page
+        return (a[0] + gap * nx, a[1] + gap * ny), ang
+    x0, y0, _, _ = o["g"].bounds
+    return (x0, y0 - gap), 0.0
+
+
 def write_pdf(pdf, out_path, objs):
     doc = pymupdf.open(pdf)
     page = doc[0]
@@ -1448,11 +1526,10 @@ def write_pdf(pdf, out_path, objs):
             page.draw_polyline(pts, color=col, width=0.6, oc=layers[name])
             x0, y0, x1, y1 = o["g"].bounds
             page.draw_rect(pymupdf.Rect(x0, y0, x1, y1), color=col, width=0.25, dashes="[2 2] 0", oc=layers[name])
-        tag = (o["key"] or "?") if o["cls"] else f"C{o['cluster']}"
-        if o["type_source"].startswith("inferred"):
-            tag = "~" + tag
-        x0, y0, _, _ = o["g"].bounds
-        page.insert_text(pymupdf.Point(x0, y0 - 0.6), tag, fontsize=2.8, color=col, oc=layers[name])
+        (ax, ay), ang = label_anchor(o)
+        pt = pymupdf.Point(ax, ay)
+        page.insert_text(pt, display_label(o), fontsize=2.6, color=col, oc=layers[name],
+                         morph=(pt, pymupdf.Matrix(-ang)) if ang else None)   # page y points down
     doc.save(out_path, garbage=3, deflate=True)
 
 
@@ -1620,8 +1697,13 @@ def run(pdf, cfg, reference=None):
     for o in objs:
         if o["cls"] == "column" and not o.get("piece"):
             continue
-        wall_like = o["kind"] == "cross_hatch" or o.get("piece") or \
-            (o["kind"] == "solid" and o["feat"]["width"] <= 2 * wall_w and o["feat"]["length"] >= 2 * o["feat"]["width"])
+        f = o["feat"]
+        # a wall drawn only by its outline, with a pattern inside (dots or strokes): wall-shaped
+        # (longer than 4 x its width, EN 1992) and no thicker than the plan's walls
+        outline_wall = o["kind"] == "outline" and f["width"] and f["length"] > es.T.ec2_ratio * f["width"] \
+            and f["width"] <= 2 * wall_w and f["dots_inside"] >= 1
+        wall_like = o["kind"] == "cross_hatch" or o.get("piece") or outline_wall or \
+            (o["kind"] == "solid" and f["width"] <= 2 * wall_w and f["length"] >= 2 * f["width"])
         if not wall_like or o["type_source"].startswith("printed"):
             continue
         if o.get("piece") or (o["cls"] in (None, "shear_wall", "core_wall", "unconfirmed") and not (o["cls"] == "shear_wall" and o["key"])):
@@ -1631,6 +1713,21 @@ def run(pdf, cfg, reference=None):
             else:
                 o["cls"] = "core_wall"
                 o["wall_rule"] = o.get("named_by") if o.get("piece") else "rule: unlabelled interior wall, no V type of its size"
+            if outline_wall:
+                o["wall_rule"] += " (drawn as an outline with a pattern inside)"
+    # retaining walls found by the edge rule take the type of their thickness, learned from the walls
+    # whose printed labels name a type of that class on this plan (VP20 = the 20 cm ones here)
+    thick = collections.defaultdict(list)
+    for o in objs:
+        if o["cls"] == "retaining_wall" and o["key"] and o["type_source"].startswith("printed"):
+            thick[o["key"]].append(o["feat"]["width"])
+    for o in objs:
+        if o["cls"] == "retaining_wall" and not o["key"] and o.get("wall_rule"):
+            fits = sorted((abs(statistics.median(ws) - o["feat"]["width"]), key) for key, ws in thick.items()
+                          if abs(statistics.median(ws) - o["feat"]["width"]) <= G.width_tol)
+            if fits:
+                o["key"] = "|".join(key for _, key in fits)
+                o["type_source"] = "inferred: the thickness of this retaining-wall type" + (" (several fit, nearest first)" if len(fits) > 1 else "")
     ver = validate(objs, reference, k) if reference else None
     return {"objs": objs, "info": info, "labels": labels, "m1": m1, "m2": m2, "log": log, "ver": ver,
             "calib": calib, "regions": regions, "k": k}
