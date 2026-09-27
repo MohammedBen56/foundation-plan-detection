@@ -1,0 +1,7 @@
+# Python >= 3.11 (tomllib)
+pymupdf>=1.24
+shapely>=2.0
+numpy>=1.26
+scipy>=1.11
+scikit-learn>=1.3
+openpyxl>=3.1

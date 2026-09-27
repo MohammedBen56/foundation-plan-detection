@@ -1,0 +1,131 @@
+# Plan conventions and tolerances used by detect_structures.py.
+#
+# Nothing here is a colour or a layer name: the drawing style of each element family is
+# learned from the plan itself, by looking at the shapes sitting next to its labels.
+# What stays configurable is (a) how labels are written, which is a drafting convention
+# (French/Moroccan here), and (b) tolerances, all in metres so they hold at any scale.
+
+[calibration]
+# a dimension line is len = scale * value - gap; samples farther than this from the fit are ignored
+tolerance = 0.02                # in the dimension text's own unit (metres on this plan)
+min_value_spread = 1.0          # only pairs of dimensions differing by more than this feed the slope
+min_inlier_share = 0.6          # below this the scale is considered unreliable and the run stops
+min_samples = 10
+
+[text]
+# stroked text is split into single glyphs; any path smaller than this share of the
+# typical text height is treated as a glyph, not as a drawn element
+glyph_share_of_text_height = 0.66
+
+[style_learning]
+search_radius_m = 1.5           # how far from a label its element is looked for
+keep_share_of_top_vote = 0.5    # a colour/layer is kept if it has at least this share of the winner's votes
+
+# ---------------------------------------------------------------------------
+# Labels. Named groups: type, bld (building), and for sized labels a, b, h.
+# `key` builds the type identifier; `sized_key` is used when a/b/h are present.
+# `per_building = true` means the same type can have a different size in each building.
+# `size_match` = "both" (default) or "width": which dimensions must agree to infer a type.
+# ---------------------------------------------------------------------------
+[labels.column]
+pattern = '^P(?P<type>\d+[a-z]?)\s*/\s*(?P<bld>\d{3})'
+key = "P{type}/{bld}"
+per_building = true
+
+[labels.wall]
+pattern = '^V(?P<type>\d+[a-z]?)\s*/\s*(?P<bld>\d{3})'
+key = "V{type}/{bld}"
+per_building = true
+
+[labels.retaining_wall]
+pattern = '^VP(?P<type>\d+)'
+key = "VP{type}"
+per_building = false
+size_match = "width"            # VP20 = 20 cm thick at any length: compare thickness only
+
+[labels.footing]
+pattern = '^(?P<series>SC|S)(?P<type>\d+)\s*-?\s*(?P<bld>\d{3})?(?:.*?\((?P<a>\d+)x(?P<b>\d+)x(?P<h>\d+)\))?'
+key = "{series}{type}"
+sized_key = "{series}{type}({a}x{b}x{h})"
+size_unit_m = 0.01              # a, b, h are written in cm
+per_building = false
+
+[labels.footing.series_subclass]
+S = "isolated_footing"
+SC = "combined_footing"
+
+# Labels that name a region rather than one drawn shape.
+# The raft stamp: a word in a circle, the thickness (cm) written with it or as the number under it.
+[region_labels.raft]
+pattern = '(?i)^radier'
+exclude = '(?i)relevage'
+thickness = '(\d{2,3})\s*CM'
+number = '\d{2,3}'
+key = "Radier"
+
+[region_labels.pit]
+pattern = '(?i)fosse\s+de\s+relevage'
+key = "Fosse"
+
+[crane]
+note_pattern = 'GRUE'           # French for crane
+group_radius_m = 12.0           # sized footings this close to the note are candidate members
+note_margin_m = 3.0             # the note must sit within this distance of the members' outline
+min_members = 2
+
+# ---------------------------------------------------------------------------
+# Shape tolerances (metres unless stated)
+# ---------------------------------------------------------------------------
+[column]
+min_width = 0.15
+max_length = 3.0
+min_rectness = 0.95             # shape area / area of its minimum rotated rectangle
+merge_gap = 0.02                # fills closer than this are one element (solid hatches come in pieces)
+
+[wall]
+min_area = 0.01                 # m2
+min_rectness = 0.97             # below this the walls are a connected network
+merge_gap = 0.004
+
+[footing]
+min_area = 0.5                  # m2
+min_rectness = 0.97
+max_aspect = 3.0
+
+# Unlabelled on this plan, so its style cannot be learned from labels: it is given
+# explicitly. Remove the section to skip the class.
+[mass_concrete_pad]
+stroke = [0.5, 0.5, 0.5]
+min_line_width_pt = 0.5
+min_side = 0.4
+max_side = 1.2
+max_aspect = 1.2
+min_rectness = 0.95
+
+[matching]
+column_radius = 1.5
+wall_radius = 1.5
+footing_near = 1.0
+footing_far = 2.5               # second pass, only for labels whose type size is known
+footing_fallback_radius = 3.0   # any-style rectangle of the right size around a leftover label
+size_tolerance = 0.03
+dedupe_iou = 0.9
+same_shape_overlap = 0.5        # a shape overlapping an existing one by more than this share is the same element
+pad_dedupe_iou = 0.3
+building_radius = 15.0          # labels within this distance vote for an unlabelled element's building
+
+# ---------------------------------------------------------------------------
+# Elements drawn as a pair of parallel lines. The label states the width; which of its
+# numbers is the width is decided from the drawing (the one with a band of that width
+# next to most of the labels). mode: "empty" = nothing inside (grade beam),
+# "wall" = a wall runs inside it (strip footing under a wall).
+# ---------------------------------------------------------------------------
+[bands.grade_beam]
+label = '^LG[\s\-]*(?P<a>\d+)\s*[xX]\s*(?P<b>\d+)'
+key = "LG{a}x{b}"
+mode = "empty"
+
+[bands.strip_footing]
+label = 'SF(?P<type>\d+)\D*?(?P<a>\d+)\s*[xX]\s*(?P<b>\d+)'
+key = "SF{type}"
+mode = "wall"
