@@ -12,19 +12,26 @@ Elements are found from the drawing's geometry. **No colour and no CAD layer is 
 
 | File | Content |
 |---|---|
-| `out/annotated.pdf` | **The annotated drawing.** Each element is boxed and labelled with its class, type and size, e.g. `Column P1/128 1.00 × 0.25 m` or `Retaining wall VP20 18.13 × 0.20 m`. There is one PDF layer per class, so classes can be switched on and off. Objects no label could name are in one hidden layer per group. |
-| `out/annotated.png` | The same page rendered at 150 dpi. The JSON pixel coordinates refer to this image. |
-| `out/detections.json` | **The detections**, machine-readable (format below). |
+| `out/annotated.pdf` | **The annotated drawing**, written by the run (not in the repository, see below). Each element is boxed and labelled with its class, type and size, e.g. `Column P1/128 1.00 × 0.25 m` or `Retaining wall VP20 18.13 × 0.20 m`. There is one PDF layer per class, so classes can be switched on and off. Objects no label could name are in one hidden layer per group. |
+| `out/annotated.png` | The same page rendered at 150 dpi, also written by the run. The JSON pixel coordinates refer to this image. |
+| `out/detections.json` | **The detections**, machine-readable (format below). Included. |
 | `detect_elements.py` | The detector: objects, clusters, labels, classes, outputs. Its tolerances are in `G`. |
 | `drawing.py` | Reading the PDF, the scale, geometric primitives and the label grammar. Its tolerances are in `T`. |
 | `plan_config.toml` | The plan's label wording (P, V, VP, S/SC, SF, LG, Radier, Fosse) and the scale-fit settings. |
 
 ## Run
 
+The plan is confidential, so neither it nor anything rendered from it is in this repository. `*.pdf` and `*.png` are git-ignored.
+
+1. Copy the plan into this folder, next to `detect_elements.py`: `GHF_EXE_PLN_STR (1)-FONDATIONS (1).pdf`.
+2. Run:
+
 ```bash
 pip install -r requirements.txt        # Python >= 3.11
 python detect_elements.py "GHF_EXE_PLN_STR (1)-FONDATIONS (1).pdf" --out out
 ```
+
+This writes `out/annotated.pdf`, `out/annotated.png` and `out/detections.json`. The plan can also be anywhere else; pass its path instead.
 
 It takes about 2 minutes. `--dpi` sets the PNG's resolution and therefore the JSON's pixel scale (default 150). `--config` points to another label grammar.
 
